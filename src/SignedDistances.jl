@@ -1,36 +1,37 @@
 module SignedDistances
 
 using Base.Threads
-using GeometryBasics: Point3
+using GeometryBasics
 using LinearAlgebra
 
 export SignedDistanceMesh, preprocess_mesh, compute_signed_distance, compute_signed_distance!
 
-#################################   Feature Codes and Utilities   #################################
+##################################   Feature Codes & Utilities   ##################################
 
-# feature codes double as tuple indices into TriangleNormals.normals
-const FEAT_V1 = UInt8(1)   # vertex 1 (a)
-const FEAT_V2 = UInt8(2)   # vertex 2 (b)
-const FEAT_V3 = UInt8(3)   # vertex 3 (c)
-const FEAT_E12 = UInt8(4)  # edge AB (v0-v1)
-const FEAT_E23 = UInt8(5)  # edge BC (v1-v2)
-const FEAT_E31 = UInt8(6)  # edge CA (v2-v0)
-const FEAT_FACE = UInt8(7) # face interior
+# feature codes double as tuple indices into TriangleNormals.normals,
+# enabling O(1) branchless pseudonormal lookup: normals[feat].
+const FEAT_V1 = UInt8(1)     # vertex 1 (a)
+const FEAT_V2 = UInt8(2)     # vertex 2 (b)
+const FEAT_V3 = UInt8(3)     # vertex 3 (c)
+const FEAT_E12 = UInt8(4)    # edge AB  (v1–v2)
+const FEAT_E23 = UInt8(5)    # edge BC  (v2–v3)
+const FEAT_E31 = UInt8(6)    # edge CA  (v3–v1)
+const FEAT_FACE = UInt8(7)   # face interior
 
 @inline function norm²(point::Point3{T}) where {T<:AbstractFloat}
-    magnitude = point ⋅ point
-    return magnitude::T
+    n² = point ⋅ point
+    return n²::T
 end
 
-@inline function normalize_safe(point::Point3{T}) where {T<:AbstractFloat}
+@inline function normalize(point::Point3{T}) where {T<:AbstractFloat}
     ε = nextfloat(Float32)
-    magnitude = norm²(point)
-    c = (magnitude > ε) * inv(√(magnitude))
-    point_normalized = c * point
-    return point_normalized::Point3{T}
+    n² = norm²(point)
+    c = (n² > ε) * inv(√(n²))
+    point_n = c * point
+    return point_n::Point3{T}
 end
 
-# angle_between is stable near 0 and 180 degrees
+# stable angle via atan(‖ × ‖, ⋅ ) — avoids division, clamp, and acos instability near 0°/180°
 @inline function angle_between(u::Point3{T}, v::Point3{T}) where {T<:AbstractFloat}
     x = u ⋅ v
     y = √(norm²(u × v))
@@ -40,757 +41,619 @@ end
 
 #######################################   Data Structures   #######################################
 
-# packed triangle vertices stay contiguous by BVH leaf order for cache locality
+# packed triangle vertices (contiguous by BVH leaf order for cache locality)
 struct TriangleGeometry{T<:AbstractFloat}
-    v0::Point3{T}
-    v1::Point3{T}
-    v2::Point3{T}
+    a::Point3{T}
+    ab::Point3{T}
+    ac::Point3{T}
 end
 
-# tuple indices match FEAT_* for O(1) pseudonormal lookup: normals[feat]
+# all 7 pseudonormals packed per-triangle.
+# tuple indices match feature codes for O(1) lookup: normals[feat]
+#   [1]=v1  [2]=v2  [3]=v3  [4]=e12  [5]=e23  [6]=e31  [7]=face
 struct TriangleNormals{T<:AbstractFloat}
     normals::NTuple{7,Point3{T}}
 end
 
-# Struct-of-Arrays (SoA) Bounding Volume Hierarchy (BVH) layout keeps pruning reads compact
-struct BVH{T<:AbstractFloat}
-    bminx::Vector{T}
-    bminy::Vector{T}
-    bminz::Vector{T}
-    bmaxx::Vector{T}
-    bmaxy::Vector{T}
-    bmaxz::Vector{T}
+# BVH with SoA layout (each field is a separate array for minimal cache-footprint during pruning)
+struct BoundingVolumeHierarchy{T<:AbstractFloat}
+    lb_x::Vector{T}
+    lb_y::Vector{T}
+    lb_z::Vector{T}
+    ub_x::Vector{T}
+    ub_y::Vector{T}
+    ub_z::Vector{T}
     left::Vector{Int32}
     right::Vector{Int32}
-    first::Vector{Int32} # leaf range start into packed triangle arrays
-    count::Vector{Int32} # leaf count, 0 indicates internal node
+    # leaf range start (indexes into packed tri arrays)
+    leaf_start::Vector{Int32}
+    # leaf size (0 → internal node)
+    leaf_sizes::Vector{Int32}
+    leaf_capacity::Int32
     num_nodes::Int32
-    leaf_size::Int32
 end
 
-# node id plus precomputed AABB lower bound avoids recomputing when popped
-struct NodeDistance{T<:AbstractFloat}
+# stack element carrying both node id and its already-computed AABB lower bound.
+# this avoids recomputing aabb_dist² again when the node is popped.
+struct NodeDist{T<:AbstractFloat}
     node::Int32
     dist²::T
 end
 
-# geometry and distance type is Tg, pseudonormal sign type is Ts
+# Tg: geometry/distance type (Float32 recommended)
+# Ts: pseudonormal/sign type (Float64 recommended)
 struct SignedDistanceMesh{Tg<:AbstractFloat,Ts<:AbstractFloat}
-    triangle_geometry::Vector{TriangleGeometry{Tg}}
-    triangle_normals::Vector{TriangleNormals{Ts}}
-    bvh::BVH{Tg}
+    tri_geometries::Vector{TriangleGeometry{Tg}}   # packed by BVH leaf order
+    tri_normals::Vector{TriangleNormals{Ts}}       # packed by BVH leaf order
+    bvh::BoundingVolumeHierarchy{Tg}
+    # face_to_packed[f] = packed triangle index for original face id f
+    # (used to exploit your “source triangle” hints)
     face_to_packed::Vector{Int32}
-    stacks::Vector{Vector{NodeDistance{Tg}}}
+    # pre-allocated per-thread traversal stacks (avoid allocations in hot loop)
+    stacks::Vector{Vector{NodeDist{Tg}}}
 end
 
-#######################   BVH Construction via Quickselect   #######################
+#######################################   BVH Construction   #######################################
 
-# partition indices by centroid along one axis for kth selection
-function nth_element!(
-    idxs::Vector{Int32},
-    lo::Int,
-    hi::Int,
-    k::Int,
-    axis::Int,
-    cx::Vector,
-    cy::Vector,
-    cz::Vector
-)
-    @inline function centroid_get(tri::Int32)
-        if axis == 1
-            return cx[tri]
-        elseif axis == 2
-            return cy[tri]
-        end
-        return cz[tri]
-    end
-
-    while lo < hi
-        pivot = idxs[(lo+hi)>>>1]
-        pivotv = centroid_get(pivot)
-
-        i = lo
-        j = hi
-        @inbounds while i <= j
-            while centroid_get(idxs[i]) < pivotv
-                i += 1
-            end
-            while centroid_get(idxs[j]) > pivotv
-                j -= 1
-            end
-            if i <= j
-                (idxs[i], idxs[j]) = (idxs[j], idxs[i])
-                i += 1
-                j -= 1
-            end
-        end
-
-        if k <= j
-            hi = j
-        elseif k >= i
-            lo = i
-        else
-            return nothing
-        end
-    end
-    return nothing
+# full sort of indices by centroid along axis (build-time only)
+function median_split_sort!(
+    indices::Vector{Int32},
+    slice::AbstractUnitRange{Int},
+    centroids::NTuple{3,Vector{Tg}},
+    axis::Int
+) where {Tg<:AbstractFloat}
+    sub_indices = @view indices[slice]
+    centroids_axis = centroids[axis]
+    sort!(sub_indices; by=tri_idx -> centroids_axis[tri_idx])
+    return indices
 end
 
-mutable struct BVHBuilder{T<:AbstractFloat}
-    bminx::Vector{T}
-    bminy::Vector{T}
-    bminz::Vector{T}
-    bmaxx::Vector{T}
-    bmaxy::Vector{T}
-    bmaxz::Vector{T}
-    left::Vector{Int32}
-    right::Vector{Int32}
-    first::Vector{Int32}
-    count::Vector{Int32}
+mutable struct BVHBuilder{T}
+    const lb_x::Vector{T}
+    const lb_y::Vector{T}
+    const lb_z::Vector{T}
+    const ub_x::Vector{T}
+    const ub_y::Vector{T}
+    const ub_z::Vector{T}
+    const left::Vector{Int32}
+    const right::Vector{Int32}
+    const leaf_start::Vector{Int32}
+    const leaf_sizes::Vector{Int32}
+    const leaf_capacity::Int32
     next_node::Int32
-    leaf_size::Int32
 end
 
 function build_node!(
     builder::BVHBuilder{T},
-    idxs::Vector{Int32},
-    lo::Int,
-    hi::Int,
-    tbminx::Vector{T},
-    tbminy::Vector{T},
-    tbminz::Vector{T},
-    tbmaxx::Vector{T},
-    tbmaxy::Vector{T},
-    tbmaxz::Vector{T},
-    cx::Vector{T},
-    cy::Vector{T},
-    cz::Vector{T}
-) where {T<:AbstractFloat}
+    tri_indices::Vector{Int32}, lo::Int, hi::Int, centroids::NTuple{3,Vector{T}},
+    lb_x_t::Vector{T}, lb_y_t::Vector{T}, lb_z_t::Vector{T},
+    ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T},
+) where {T}
     node = builder.next_node
     builder.next_node += 1
 
-    # load node bounds once to maximize scalar reuse in this loop
-    minx = T(Inf)
-    miny = T(Inf)
-    minz = T(Inf)
-    maxx = -T(Inf)
-    maxy = -T(Inf)
-    maxz = -T(Inf)
-    @inbounds for i in lo:hi
-        tri = idxs[i]
-        minx = min(minx, tbminx[tri])
-        miny = min(miny, tbminy[tri])
-        minz = min(minz, tbminz[tri])
-        maxx = max(maxx, tbmaxx[tri])
-        maxy = max(maxy, tbmaxy[tri])
-        maxz = max(maxz, tbmaxz[tri])
-    end
-
+    # compute node bounds
+    min_x = T(Inf)
+    min_y = T(Inf)
+    min_z = T(Inf)
+    max_x = -T(Inf)
+    max_y = -T(Inf)
+    max_z = -T(Inf)
     @inbounds begin
-        builder.bminx[node] = minx
-        builder.bminy[node] = miny
-        builder.bminz[node] = minz
-        builder.bmaxx[node] = maxx
-        builder.bmaxy[node] = maxy
-        builder.bmaxz[node] = maxz
+        for i in lo:hi
+            t = tri_indices[i]
+            min_x = min(min_x, lb_x_t[t])
+            min_y = min(min_y, lb_y_t[t])
+            min_z = min(min_z, lb_z_t[t])
+            max_x = max(max_x, ub_x_t[t])
+            max_y = max(max_y, ub_y_t[t])
+            max_z = max(max_z, ub_z_t[t])
+        end
+        builder.lb_x[node] = min_x
+        builder.lb_y[node] = min_y
+        builder.lb_z[node] = min_z
+        builder.ub_x[node] = max_x
+        builder.ub_y[node] = max_y
+        builder.ub_z[node] = max_z
     end
 
-    tri_count = hi - lo + 1
-    if tri_count <= builder.leaf_size
+    n = hi - lo + 1
+    if n <= builder.leaf_capacity
         @inbounds begin
             builder.left[node] = 0
             builder.right[node] = 0
-            builder.first[node] = Int32(lo)
-            builder.count[node] = Int32(tri_count)
+            builder.leaf_start[node] = Int32(lo)
+            builder.leaf_sizes[node] = Int32(n)
         end
         return node
     end
 
-    # split on longest centroid extent to reduce overlap
-    cminx = T(Inf)
-    cminy = T(Inf)
-    cminz = T(Inf)
-    cmaxx = -T(Inf)
-    cmaxy = -T(Inf)
-    cmaxz = -T(Inf)
+    # split axis = longest centroid extent
+    centroid_min_x = T(Inf)
+    centroid_min_y = T(Inf)
+    centroid_min_z = T(Inf)
+    centroid_max_x = -T(Inf)
+    centroid_max_y = -T(Inf)
+    centroid_max_z = -T(Inf)
     @inbounds for i in lo:hi
-        tri = idxs[i]
-        cminx = min(cminx, cx[tri])
-        cminy = min(cminy, cy[tri])
-        cminz = min(cminz, cz[tri])
-        cmaxx = max(cmaxx, cx[tri])
-        cmaxy = max(cmaxy, cy[tri])
-        cmaxz = max(cmaxz, cz[tri])
+        t = tri_indices[i]
+        centroid_min_x = min(centroid_min_x, centroids[1][t])
+        centroid_min_y = min(centroid_min_y, centroids[2][t])
+        centroid_min_z = min(centroid_min_z, centroids[3][t])
+        centroid_max_x = max(centroid_max_x, centroids[1][t])
+        centroid_max_y = max(centroid_max_y, centroids[2][t])
+        centroid_max_z = max(centroid_max_z, centroids[3][t])
     end
+    spread_x = centroid_max_x - centroid_min_x
+    spread_y = centroid_max_y - centroid_min_y
+    spread_z = centroid_max_z - centroid_min_z
+    (spread_max, axis) = findmax((spread_x, spread_y, spread_z))
 
-    ex = cmaxx - cminx
-    ey = cmaxy - cminy
-    ez = cmaxz - cminz
-    axis = 3
-    if ex >= ey && ex >= ez
-        axis = 1
-    elseif ey >= ez
-        axis = 2
-    end
+    mid = (lo + hi) >>> 1   # (lo + hi) ÷ 2
+    # median split via full sort (skip if all centroids identical along all axes)
+    (spread_max > 0) && median_split_sort!(tri_indices, lo:hi, centroids, axis)
 
-    mid = (lo + hi) >>> 1
-    if ex > 0 || ey > 0 || ez > 0
-        nth_element!(idxs, lo, hi, mid, axis, cx, cy, cz)
-    end
-
-    left_node = build_node!(
-        builder,
-        idxs,
-        lo,
-        mid,
-        tbminx,
-        tbminy,
-        tbminz,
-        tbmaxx,
-        tbmaxy,
-        tbmaxz,
-        cx,
-        cy,
-        cz
+    leftnode = build_node!(
+        builder, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
-    right_node = build_node!(
-        builder,
-        idxs,
-        mid + 1,
-        hi,
-        tbminx,
-        tbminy,
-        tbminz,
-        tbmaxx,
-        tbmaxy,
-        tbmaxz,
-        cx,
-        cy,
-        cz
+    rightnode = build_node!(
+        builder, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
-
     @inbounds begin
-        builder.left[node] = left_node
-        builder.right[node] = right_node
-        builder.first[node] = 0
-        builder.count[node] = 0
+        builder.left[node] = leftnode
+        builder.right[node] = rightnode
+        builder.leaf_start[node] = 0
+        builder.leaf_sizes[node] = 0
     end
-
     return node
 end
 
 function build_bvh(
-    ::Type{T},
-    tbminx,
-    tbminy,
-    tbminz,
-    tbmaxx,
-    tbmaxy,
-    tbmaxz,
-    cx,
-    cy,
-    cz;
-    leaf_size::Int=8
-) where {T<:AbstractFloat}
-    tri_count = length(cx)
-    tri_idxs = Vector{Int32}(undef, tri_count)
-    @inbounds for i in eachindex(tri_idxs)
-        tri_idxs[i] = Int32(i)
-    end
+    centroids::NTuple{3,Vector{Tg}},
+    lb_x_t::Vector{Tg}, lb_y_t::Vector{Tg}, lb_z_t::Vector{Tg},
+    ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg};
+    leaf_capacity::Int=8
+) where {Tg}
+    num_tri = length(first(centroids))
+    tri_indices = Int32.(1:num_tri)
 
-    max_nodes = 2 * tri_count - 1
-    builder = BVHBuilder{T}(
-        Vector{T}(undef, max_nodes),
-        Vector{T}(undef, max_nodes),
-        Vector{T}(undef, max_nodes),
-        Vector{T}(undef, max_nodes),
-        Vector{T}(undef, max_nodes),
-        Vector{T}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes),
-        Int32(1),
-        Int32(leaf_size)
+    max_nodes = 2 * num_tri - 1
+    builder = BVHBuilder{Tg}(  # use Tg for BVHBuilder to avoid allocations
+        Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
+        Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
+        Vector{Int32}(undef, max_nodes), Vector{Int32}(undef, max_nodes),
+        Vector{Int32}(undef, max_nodes), Vector{Int32}(undef, max_nodes),
+        Int32(leaf_capacity), Int32(1)
     )
-
     build_node!(
-        builder,
-        tri_idxs,
-        1,
-        tri_count,
-        tbminx,
-        tbminy,
-        tbminz,
-        tbmaxx,
-        tbmaxy,
-        tbmaxz,
-        cx,
-        cy,
-        cz
+        builder, tri_indices, 1, num_tri, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
 
     num_nodes = builder.next_node - 1
-    bvh = BVH{T}(
-        builder.bminx,
-        builder.bminy,
-        builder.bminz,
-        builder.bmaxx,
-        builder.bmaxy,
-        builder.bmaxz,
-        builder.left,
-        builder.right,
-        builder.first,
-        builder.count,
-        num_nodes,
-        builder.leaf_size
+    bvh = BoundingVolumeHierarchy{Tg}(
+        builder.lb_x, builder.lb_y, builder.lb_z,
+        builder.ub_x, builder.ub_y, builder.ub_z,
+        builder.left, builder.right, builder.leaf_start, builder.leaf_sizes,
+        builder.leaf_capacity, num_nodes
     )
-    return (bvh, tri_idxs)
+    return (bvh, tri_indices)  # return triangle order for packing
 end
 
-#############################   Mesh Preprocessing   ##############################
+######################################   Mesh Preprocessing   ######################################
 
 @inline function edge_key(a::Int32, b::Int32)
-    if a < b
-        return (UInt64(a) << 32) | UInt64(b)
-    end
-    return (UInt64(b) << 32) | UInt64(a)
+    (lo, hi) = minmax(a, b)
+    key = (UInt64(lo) << 32) | UInt64(hi)
+    return key
 end
 
 """
-    preprocess_mesh(V, F; leaf_size=8, stack_capacity=256, sign_type=Float64)
+    preprocess_mesh(vertices, faces; leaf_capacity=8, stack_capacity=256, sign_type=Float64)
 
-build the acceleration structure for signed-distance queries on a
-watertight, consistently-oriented triangle mesh
+Build the acceleration structure for signed-distance queries on a
+watertight, consistently-oriented triangle mesh.
 
-- `V`: `3 × nV` matrix of vertex positions (Float32 recommended)
-- `F`: `3 × nF` matrix of 1-based vertex indices
+- `vertices`:  `3 × nV` matrix of vertex positions (Float32 recommended).
+- `faces`:     `3 × nF` matrix of 1-based vertex indices.
 
-`sign_type` controls the floating-point type used for pseudo-normal sign tests
-using `Float64` is recommended for inside/outside robustness
+`sign_type` controls the floating-point type used for *pseudo-normal sign tests*.
+Using `Float64` is recommended for robustness of the inside/outside sign.
 
-returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls
+Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls.
 """
 function preprocess_mesh(
-    Vmat::StridedMatrix{Tg},
-    Fmat::StridedMatrix{<:Integer};
-    leaf_size::Int=8,
-    stack_capacity::Int=256,
-    sign_type::Type{Ts}=Float64
-) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    @assert size(Vmat, 1) == 3 "V must be 3×nV"
-    @assert size(Fmat, 1) == 3 "F must be 3×nF"
+    mesh::Mesh{3,Float32,GLTriangleFace};
+    leaf_capacity::Int=8, stack_capacity::Int=256, sign_type::Type{Ts}=Float64
+) where {Ts<:AbstractFloat}
+    Tg = Float32
+    vertices = GeometryBasics.coordinates(mesh)
+    tri_faces = GeometryBasics.faces(mesh)
+    faces = NTuple{3,Int32}.(tri_faces)
+    num_vertices = length(vertices)
+    num_faces = length(faces)
 
-    n_vertex = size(Vmat, 2)
-    n_face = size(Fmat, 2)
-
-    vertices = reinterpret(Point3{Tg}, vec(Vmat)) |> collect
-
-    faces = Matrix{Int32}(undef, 3, n_face)
-    @inbounds for f in axes(faces, 2)
-        faces[1, f] = Int32(Fmat[1, f])
-        faces[2, f] = Int32(Fmat[2, f])
-        faces[3, f] = Int32(Fmat[3, f])
+    # face unit normals computed in Ts (Float64 recommended)
+    normals = Vector{Point3{Ts}}(undef, num_faces)
+    @inbounds for idx_face in eachindex(faces)
+        (idx_v1, idx_v2, idx_v3) = faces[idx_face]
+        v1 = Point3{Ts}(vertices[idx_v1])
+        v2 = Point3{Ts}(vertices[idx_v2])
+        v3 = Point3{Ts}(vertices[idx_v3])
+        normal = (v2 - v1) × (v3 - v1)
+        normals[idx_face] = normalize(normal)
     end
 
-    face_normals = Vector{Point3{Ts}}(undef, n_face)
-    @inbounds for f in axes(faces, 2)
-        (a32, b32, c32) = (vertices[faces[1, f]], vertices[faces[2, f]], vertices[faces[3, f]])
-        a = Point3{Ts}(Ts(a32[1]), Ts(a32[2]), Ts(a32[3]))
-        b = Point3{Ts}(Ts(b32[1]), Ts(b32[2]), Ts(b32[3]))
-        c = Point3{Ts}(Ts(c32[1]), Ts(c32[2]), Ts(c32[3]))
-        normal_face = cross(b - a, c - a)
-        face_normals[f] = normalize_safe(Point3{Ts}(normal_face[1], normal_face[2], normal_face[3]))
-    end
-
-    # local edge adjacency drives edge pseudonormal accumulation
-    adj = zeros(Int32, 3, n_face)
-    edge_to_face = Dict{UInt64,Tuple{Int32,Int32}}()
-    @inbounds for f in axes(faces, 2)
-        (i1, i2, i3) = (faces[1, f], faces[2, f], faces[3, f])
-        for (e, v_a, v_b) in ((Int32(1), i1, i2), (Int32(2), i2, i3), (Int32(3), i3, i1))
-            key = edge_key(v_a, v_b)
-            if haskey(edge_to_face, key)
-                (f2, e2) = edge_to_face[key]
-                adj[e, f] = f2
-                adj[e2, f2] = Int32(f)
-                delete!(edge_to_face, key)
+    # face_adjacency[edge, face] = index of the face sharing local `edge` of `face` (0 if boundary)
+    face_adjacency = zeros(Int32, 3, num_faces)
+    neighbors = Dict{UInt64,Tuple{Int32,Int32}}()
+    @inbounds for idx_face in eachindex(faces)
+        (idx_v1, idx_v2, idx_v3) = faces[idx_face]
+        for (edge, vertex_a, vertex_b) in ((Int32(1), idx_v1, idx_v2), (Int32(2), idx_v2, idx_v3), (Int32(3), idx_v3, idx_v1))
+            key = edge_key(vertex_a, vertex_b)
+            pair = get(neighbors, key, nothing)
+            if pair === nothing
+                neighbors[key] = (Int32(idx_face), edge)
             else
-                edge_to_face[key] = (Int32(f), e)
+                (face_adjacent, edge_common) = pair
+                face_adjacency[edge, idx_face] = face_adjacent
+                face_adjacency[edge_common, face_adjacent] = Int32(idx_face)
+                delete!(neighbors, key)
             end
         end
     end
+    @assert isempty(neighbors) "mesh is not watertight: $(length(neighbors)) boundary edges"
 
-    edge_pseudonormals = Vector{Point3{Ts}}(undef, 3 * n_face)
-    @inbounds for f in axes(faces, 2)
-        normal_face = face_normals[f]
-        for e in axes(adj, 1)
-            normal_nb_idx = adj[e, f]
-            edge_idx = 3 * (f - 1) + e
-            if normal_nb_idx == 0
-                edge_pseudonormals[edge_idx] = normal_face
-            else
-                normal_sum = normal_face + face_normals[normal_nb_idx]
-                edge_pseudonormals[edge_idx] = Point3{Ts}(
-                    normal_sum[1],
-                    normal_sum[2],
-                    normal_sum[3]
-                )
-            end
+    # edge pseudonormals: sum of adjacent unit face normals (unnormalized as only sign matters)
+    pns_edge = Matrix{Point3{Ts}}(undef, 3, num_faces)
+    @inbounds for idx_face₁ in eachindex(normals)
+        normal₁ = normals[idx_face₁]
+        for edge in 1:3
+            idx_face₂ = face_adjacency[edge, idx_face₁]
+            pseudonormal = (idx_face₂ == 0) ? normal₁ : (normal₁ + normals[idx_face₂])
+            pns_edge[edge, idx_face₁] = pseudonormal
         end
     end
 
-    accx = zeros(Ts, n_vertex)
-    accy = zeros(Ts, n_vertex)
-    accz = zeros(Ts, n_vertex)
-    @inbounds for f in axes(faces, 2)
-        (i1, i2, i3) = (faces[1, f], faces[2, f], faces[3, f])
-        (a32, b32, c32) = (vertices[i1], vertices[i2], vertices[i3])
-        a = Point3{Ts}(Ts(a32[1]), Ts(a32[2]), Ts(a32[3]))
-        b = Point3{Ts}(Ts(b32[1]), Ts(b32[2]), Ts(b32[3]))
-        c = Point3{Ts}(Ts(c32[1]), Ts(c32[2]), Ts(c32[3]))
-        normal_face = face_normals[f]
+    # vertex pseudonormals (angle-weighted, unnormalized) in Ts
+    pns_vertex = zeros(Point3{Ts}, num_vertices)
+    @inbounds for idx_face in eachindex(faces)
+        face = faces[idx_face]
+        (idx_v1, idx_v2, idx_v3) = face
+        v1 = Point3{Ts}(vertices[idx_v1])
+        v2 = Point3{Ts}(vertices[idx_v2])
+        v3 = Point3{Ts}(vertices[idx_v3])
+        normal = normals[idx_face]
 
-        α1 = angle_between(b - a, c - a)
-        α2 = angle_between(c - b, a - b)
-        α3 = angle_between(a - c, b - c)
+        α1 = angle_between(v2 - v1, v3 - v1)
+        α2 = angle_between(v3 - v2, v1 - v2)
+        α3 = angle_between(v1 - v3, v2 - v3)
 
-        accx[i1] += α1 * normal_face[1]
-        accy[i1] += α1 * normal_face[2]
-        accz[i1] += α1 * normal_face[3]
-        accx[i2] += α2 * normal_face[1]
-        accy[i2] += α2 * normal_face[2]
-        accz[i2] += α2 * normal_face[3]
-        accx[i3] += α3 * normal_face[1]
-        accy[i3] += α3 * normal_face[2]
-        accz[i3] += α3 * normal_face[3]
+        # intentionally unnormalized: only sign(rvec ⋅ pn) matters for Bærentzen signing
+        pns_vertex[idx_v1] += α1 * normal
+        pns_vertex[idx_v2] += α2 * normal
+        pns_vertex[idx_v3] += α3 * normal
     end
 
-    vertex_pseudonormals = Vector{Point3{Ts}}(undef, n_vertex)
-    @inbounds for v in eachindex(vertex_pseudonormals)
-        vertex_pseudonormals[v] = Point3{Ts}(accx[v], accy[v], accz[v])
-    end
+    # build BVH (in Tg)
+    lb_x_t = Vector{Tg}(undef, num_faces)
+    lb_y_t = Vector{Tg}(undef, num_faces)
+    lb_z_t = Vector{Tg}(undef, num_faces)
+    ub_x_t = Vector{Tg}(undef, num_faces)
+    ub_y_t = Vector{Tg}(undef, num_faces)
+    ub_z_t = Vector{Tg}(undef, num_faces)
+    centroids_x = Vector{Tg}(undef, num_faces)
+    centroids_y = Vector{Tg}(undef, num_faces)
+    centroids_z = Vector{Tg}(undef, num_faces)
 
-    tbminx = Vector{Tg}(undef, n_face)
-    tbminy = Vector{Tg}(undef, n_face)
-    tbminz = Vector{Tg}(undef, n_face)
-    tbmaxx = Vector{Tg}(undef, n_face)
-    tbmaxy = Vector{Tg}(undef, n_face)
-    tbmaxz = Vector{Tg}(undef, n_face)
-    cx = Vector{Tg}(undef, n_face)
-    cy = Vector{Tg}(undef, n_face)
-    cz = Vector{Tg}(undef, n_face)
-    @inbounds for f in axes(faces, 2)
-        (a, b, c) = (vertices[faces[1, f]], vertices[faces[2, f]], vertices[faces[3, f]])
-        tbminx[f] = min(a[1], b[1], c[1])
-        tbminy[f] = min(a[2], b[2], c[2])
-        tbminz[f] = min(a[3], b[3], c[3])
-        tbmaxx[f] = max(a[1], b[1], c[1])
-        tbmaxy[f] = max(a[2], b[2], c[2])
-        tbmaxz[f] = max(a[3], b[3], c[3])
-        centroid = (a + b + c) / Tg(3)
-        cx[f] = centroid[1]
-        cy[f] = centroid[2]
-        cz[f] = centroid[3]
+    @inbounds for idx_face in eachindex(faces)
+        face = faces[idx_face]
+        (idx_v1, idx_v2, idx_v3) = face
+        v1 = vertices[idx_v1]
+        v2 = vertices[idx_v2]
+        v3 = vertices[idx_v3]
+        (x1, y1, z1) = v1
+        (x2, y2, z2) = v2
+        (x3, y3, z3) = v3
+
+        lb_x_t[idx_face] = min(x1, x2, x3)
+        lb_y_t[idx_face] = min(y1, y2, y3)
+        lb_z_t[idx_face] = min(z1, z2, z3)
+        ub_x_t[idx_face] = max(x1, x2, x3)
+        ub_y_t[idx_face] = max(y1, y2, y3)
+        ub_z_t[idx_face] = max(z1, z2, z3)
+
+        centroid = (v1 + v2 + v3) / Tg(3)
+        centroids_x[idx_face] = centroid[1]
+        centroids_y[idx_face] = centroid[2]
+        centroids_z[idx_face] = centroid[3]
     end
+    centroids = (centroids_x, centroids_y, centroids_z)
     (bvh, tri_order) = build_bvh(
-        Tg,
-        tbminx,
-        tbminy,
-        tbminz,
-        tbmaxx,
-        tbmaxy,
-        tbmaxz,
-        cx,
-        cy,
-        cz;
-        leaf_size
+        centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t; leaf_capacity
     )
 
-    triangle_geometry = Vector{TriangleGeometry{Tg}}(undef, n_face)
-    triangle_normals = Vector{TriangleNormals{Ts}}(undef, n_face)
-    face_to_packed = Vector{Int32}(undef, n_face)
+    # pack triangle geometry & normals contiguously by BVH leaf order
+    tri_geometries = Vector{TriangleGeometry{Tg}}(undef, num_faces)
+    tri_normals = Vector{TriangleNormals{Ts}}(undef, num_faces)
 
-    @inbounds for packed_idx in eachindex(tri_order)
-        face_idx = tri_order[packed_idx]
-        face_to_packed[face_idx] = Int32(packed_idx)
+    # map original face index → packed index (for triangle-hint acceleration)
+    face_to_packed = Vector{Int32}(undef, num_faces)
 
-        (i1, i2, i3) = (faces[1, face_idx], faces[2, face_idx], faces[3, face_idx])
-        triangle_geometry[packed_idx] = TriangleGeometry{Tg}(
-            vertices[i1],
-            vertices[i2],
-            vertices[i3]
-        )
+    @inbounds for j in eachindex(faces)
+        idx_face = tri_order[j]   # original face index
+        face_to_packed[idx_face] = Int32(j)
 
-        edge_base = 3 * (face_idx - 1)
-        triangle_normals[packed_idx] = TriangleNormals{Ts}((
-            vertex_pseudonormals[i1],
-            vertex_pseudonormals[i2],
-            vertex_pseudonormals[i3],
-            edge_pseudonormals[edge_base+1],
-            edge_pseudonormals[edge_base+2],
-            edge_pseudonormals[edge_base+3],
-            face_normals[face_idx]
+        (idx_v1, idx_v2, idx_v3) = faces[idx_face]
+        v1 = vertices[idx_v1]
+        v2 = vertices[idx_v2]
+        v3 = vertices[idx_v3]
+        tri_geometries[j] = TriangleGeometry{Tg}(v1, v2 - v1, v3 - v1)
+
+        # tuple indices match feature codes for direct normals[feat] lookup
+        tri_normals[j] = TriangleNormals{Ts}((
+            pns_vertex[idx_v1],      # [1] = FEAT_V1
+            pns_vertex[idx_v2],      # [2] = FEAT_V2
+            pns_vertex[idx_v3],      # [3] = FEAT_V3
+            pns_edge[1, idx_face],   # [4] = FEAT_E12
+            pns_edge[2, idx_face],   # [5] = FEAT_E23
+            pns_edge[3, idx_face],   # [6] = FEAT_E31
+            normals[idx_face],       # [7] = FEAT_FACE
         ))
     end
 
-    stacks = [Vector{NodeDistance{Tg}}(undef, stack_capacity) for _ in 1:Threads.nthreads()]
-    return SignedDistanceMesh{Tg,Ts}(
-        triangle_geometry,
-        triangle_normals,
-        bvh,
-        face_to_packed,
-        stacks
-    )
+    # per-thread stacks (pre-allocated once, reused across all queries)
+    num_threads = Threads.nthreads()
+    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_threads]
+    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed, stacks)
 end
 
-#########################   Query Hot-Loop Routines   #########################
+##############################   High-Performance Hot Loop Routines   ##############################
 
-@inline function aabb_dist²(p::Point3{Tg}, bvh::BVH{Tg}, node::Int32) where {Tg}
-    node_idx = Int(node)
-    (px, py, pz) = p
+# AABB squared distance with single bound load + branchless clamp
+@inline function aabb_dist²(
+    point::Point3{Tg}, bvh::BoundingVolumeHierarchy{Tg}, node_id::Int32
+) where {Tg}
+    (point_x, point_y, point_z) = point
     @inbounds begin
-        minx = bvh.bminx[node_idx]
-        maxx = bvh.bmaxx[node_idx]
-        miny = bvh.bminy[node_idx]
-        maxy = bvh.bmaxy[node_idx]
-        minz = bvh.bminz[node_idx]
-        maxz = bvh.bmaxz[node_idx]
+        lb_x = bvh.lb_x[node_id]
+        ub_x = bvh.ub_x[node_id]
+        lb_y = bvh.lb_y[node_id]
+        ub_y = bvh.ub_y[node_id]
+        lb_z = bvh.lb_z[node_id]
+        ub_z = bvh.ub_z[node_id]
     end
-    dx = max(max(minx - px, px - maxx), zero(Tg))
-    dy = max(max(miny - py, py - maxy), zero(Tg))
-    dz = max(max(minz - pz, pz - maxz), zero(Tg))
-    return dx * dx + dy * dy + dz * dz
+    zer = zero(Tg)
+    Δx = max(lb_x - point_x, point_x - ub_x, zer)
+    Δy = max(lb_y - point_y, point_y - ub_y, zer)
+    Δz = max(lb_z - point_z, point_z - ub_z, zer)
+    dist² = Δx * Δx + Δy * Δy + Δz * Δz
+    return dist²
 end
 
-# returns squared distance, diff=(p-closest), and FEAT_* code
-@inline function closest_diff_triangle(p::Point3{Tg}, tri::TriangleGeometry{Tg}) where {Tg}
-    (a, b, c) = (tri.v0, tri.v1, tri.v2)
-    ab = b - a
-    ac = c - a
-    ap = p - a
+# exact closest-point-on-triangle (Ericson-style) but returns Δ = p - closest_point.
+# This avoids computing and storing closest point, and makes the sign test use Δ directly.
+@inline function closest_diff_triangle(p::Point3{Tg}, tg::TriangleGeometry{Tg}) where {Tg}
+    a = tg.a
+    ab = tg.ab
+    ac = tg.ac
 
-    d1 = dot(ab, ap)
-    d2 = dot(ac, ap)
-    if d1 <= 0 && d2 <= 0
+    ap = p - a
+    d1 = ab ⋅ ap
+    d2 = ac ⋅ ap
+    if (d1 <= 0) && (d2 <= 0)
         return (norm²(ap), ap, FEAT_V1)
     end
 
-    bp = p - b
-    d3 = dot(ab, bp)
-    d4 = dot(ac, bp)
-    if d3 >= 0 && d4 <= d3
+    bp = ap - ab
+    d3 = ab ⋅ bp
+    d4 = ac ⋅ bp
+    if (d3 >= 0) && (d4 <= d3)
         return (norm²(bp), bp, FEAT_V2)
     end
 
     vc = d1 * d4 - d3 * d2
-    if vc <= 0 && d1 >= 0 && d3 <= 0
-        v = d1 / (d1 - d3)
-        diff = ap - v * ab
-        return (norm²(diff), diff, FEAT_E12)
+    if (vc <= 0) && (d1 >= 0) && (d3 <= 0)
+        v = d1 / (d1 - d3)   # bary: (1-v, v, 0)
+        Δ = ap - v * ab      # p - (a + v*ab)
+        return (norm²(Δ), Δ, FEAT_E12)
     end
 
-    cpv = p - c
-    d5 = dot(ab, cpv)
-    d6 = dot(ac, cpv)
-    if d6 >= 0 && d5 <= d6
-        return (norm²(cpv), cpv, FEAT_V3)
+    cp = ap - ac
+    d5 = ab ⋅ cp
+    d6 = ac ⋅ cp
+    if (d6 >= 0) && (d5 <= d6)
+        return (norm²(cp), cp, FEAT_V3)
     end
 
     vb = d5 * d2 - d1 * d6
-    if vb <= 0 && d2 >= 0 && d6 <= 0
-        w = d2 / (d2 - d6)
-        diff = ap - w * ac
-        return (norm²(diff), diff, FEAT_E31)
+    if (vb <= 0) && (d2 >= 0) && (d6 <= 0)
+        w = d2 / (d2 - d6)   # bary: (1-w, 0, w)
+        Δ = ap - w * ac      # p - (a + w*ac)
+        return (norm²(Δ), Δ, FEAT_E31)
     end
 
     va = d3 * d6 - d5 * d4
-    if va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0
-        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-        bc = c - b
-        diff = bp - w * bc
-        return (norm²(diff), diff, FEAT_E23)
+    if (va <= 0) && (d4 - d3) >= 0 && (d5 - d6) >= 0
+        d43 = d4 - d3
+        w = d43 / (d43 + d5 - d6)  # bary: (0, 1-w, w)
+        bc = ac - ab
+        Δ = bp - w * bc
+        return (norm²(Δ), Δ, FEAT_E23)
     end
 
     denom = inv(va + vb + vc)
     v = vb * denom
     w = vc * denom
-    diff = ap - v * ab - w * ac
-    return (norm²(diff), diff, FEAT_FACE)
+    Δ = ap - v * ab - w * ac
+    return (norm²(Δ), Δ, FEAT_FACE)
 end
 
-##############################   Single-Point Query   ##############################
+######################################   Single-Point Query   ######################################
 
 @inline function signed_distance_point(
-    sd::SignedDistanceMesh{Tg,Ts},
-    p::Point3{Tg},
-    ub::Tg,
-    stack::Vector{NodeDistance{Tg}},
-    hint_packed::Int32
+    sdm::SignedDistanceMesh{Tg,Ts},
+    point::Point3{Tg},
+    upper_bound²::Tg,
+    stack::Vector{NodeDist{Tg}},
+    hint_face::Int32
 ) where {Tg,Ts}
-    bvh = sd.bvh
-    best² = isfinite(ub) ? ub * ub * (one(Tg) + Tg(1.0e-4)) + eps(Tg) : Tg(Inf)
-    best_diff = p - p
-    best_feat = UInt8(0)
-    best_tri = Int32(0)
+    dist²_best = upper_bound²
+    Δ_best = zero(Point3{Tg})
+    feat_best = UInt8(0)
+    tri_best = Int32(0)
 
-    if hint_packed != 0
-        @inbounds begin
-            (d²_hint, diff_hint, feat_hint) = closest_diff_triangle(
-                p,
-                sd.triangle_geometry[hint_packed]
-            )
-        end
-        if d²_hint < best²
-            best² = d²_hint
-            best_diff = diff_hint
-            best_feat = feat_hint
-            best_tri = hint_packed
-        end
+    tri_geometries = sdm.tri_geometries
+    # tighten initial bound using the provided triangle hint (packed index).
+    # this is especially effective for near-surface samples.
+    @inbounds (dist²_hint, Δ_hint, feat_hint) = closest_diff_triangle(point, tri_geometries[hint_face])
+    if dist²_hint < dist²_best
+        dist²_best = dist²_hint
+        Δ_best = Δ_hint
+        feat_best = feat_hint
+        tri_best = hint_face
     end
 
-    sp = 1
-    @inbounds stack[1] = NodeDistance{Tg}(Int32(1), aabb_dist²(p, bvh, Int32(1)))
+    bvh = sdm.bvh
+    stack_top = 1
+    dist²_root = aabb_dist²(point, bvh, Int32(1))
+    @inbounds stack[1] = NodeDist{Tg}(Int32(1), dist²_root)
 
-    while sp > 0
-        @inbounds nd = stack[sp]
-        sp -= 1
+    @inbounds while stack_top > 0
+        node_dist = stack[stack_top]
+        stack_top -= 1
 
-        if nd.dist² > best²
-            continue
-        end
+        (node_dist.dist² > dist²_best) && continue
 
-        node = nd.node
-        @inbounds tri_count = bvh.count[node]
+        node = node_dist.node
+        num_triangles = bvh.leaf_sizes[node]
 
-        if tri_count != 0
-            @inbounds first = bvh.first[node]
-            j0 = Int(first)
-            j1 = j0 + Int(tri_count) - 1
-            @inbounds for j in j0:j1
-                (d², diff, feat) = closest_diff_triangle(p, sd.triangle_geometry[j])
-                if d² < best²
-                    best² = d²
-                    best_diff = diff
-                    best_feat = feat
-                    best_tri = Int32(j)
-                end
+        if num_triangles == 0
+            # internal: compute child AABB bounds once, push with stored distances
+            child_l = bvh.left[node]
+            child_r = bvh.right[node]
+
+            dist²_l = aabb_dist²(point, bvh, child_l)
+            dist²_r = aabb_dist²(point, bvh, child_r)
+
+            # sort so near child is pushed last (popped first)
+            if dist²_l > dist²_r
+                (child_l, child_r) = (child_r, child_l)
+                (dist²_l, dist²_r) = (dist²_r, dist²_l)
             end
-        else
-            @inbounds left = bvh.left[node]
-            @inbounds right = bvh.right[node]
 
-            dist²_left = aabb_dist²(p, bvh, left)
-            dist²_right = aabb_dist²(p, bvh, right)
-            push_left = dist²_left <= best²
-            push_right = dist²_right <= best²
+            # ensure room for up to 2 pushes
+            len = length(stack)
+            if (len - stack_top) < 2
+                resize!(stack, max(stack_top + 2, 2 * len))
+            end
 
-            if push_left | push_right
-                needed = sp + Int(push_left) + Int(push_right)
-                if needed > length(stack)
-                    resize!(stack, max(needed, 2 * length(stack)))
-                end
-
-                # push farther first so the nearer node is popped next
-                if dist²_left < dist²_right
-                    if push_right
-                        sp += 1
-                        @inbounds stack[sp] = NodeDistance{Tg}(right, dist²_right)
-                    end
-                    if push_left
-                        sp += 1
-                        @inbounds stack[sp] = NodeDistance{Tg}(left, dist²_left)
-                    end
-                else
-                    if push_left
-                        sp += 1
-                        @inbounds stack[sp] = NodeDistance{Tg}(left, dist²_left)
-                    end
-                    if push_right
-                        sp += 1
-                        @inbounds stack[sp] = NodeDistance{Tg}(right, dist²_right)
-                    end
+            # push far, then near
+            if dist²_r <= dist²_best
+                stack_top += 1
+                stack[stack_top] = NodeDist{Tg}(child_r, dist²_r)
+            end
+            if dist²_l <= dist²_best
+                stack_top += 1
+                stack[stack_top] = NodeDist{Tg}(child_l, dist²_l)
+            end
+        else # leaf: test triangles (data is contiguous in packed arrays)
+            leaf_start = bvh.leaf_start[node]
+            leaf_end = leaf_start + num_triangles - Int32(1)
+            for idx in leaf_start:leaf_end
+                (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
+                if dist² < dist²_best
+                    dist²_best = dist²
+                    Δ_best = Δ
+                    feat_best = feat
+                    tri_best = idx
                 end
             end
         end
     end
 
-    (best_tri == 0 && isfinite(ub)) && return signed_distance_point(
-        sd,
-        p,
-        Tg(Inf),
-        stack,
-        hint_packed
-    )
+    @assert !iszero(tri_best)
+    dist = √(dist²_best)
+    iszero(dist) && return zero(Tg)
 
-    d = √(best²)
-    (d == zero(Tg)) && return zero(Tg)
+    # O(1) branchless lookup: tuple index == feature code
+    @inbounds pseudonormal = sdm.tri_normals[tri_best].normals[feat_best]
 
-    @inbounds pn = sd.triangle_normals[best_tri].normals[Int(best_feat)]
-    dot64 = Float64(best_diff[1]) * Float64(pn[1]) +
-            Float64(best_diff[2]) * Float64(pn[2]) +
-            Float64(best_diff[3]) * Float64(pn[3])
-    sign = dot64 >= 0.0 ? one(Tg) : -one(Tg)
-    return d * sign
+    # compute sign in Float64 for robustness (even if geometry is Float32)
+    dot64 = Float64(Δ_best[1]) * Float64(pseudonormal[1]) +
+            Float64(Δ_best[2]) * Float64(pseudonormal[2]) +
+            Float64(Δ_best[3]) * Float64(pseudonormal[3])
+
+    uno = one(Tg)
+    sgn = ifelse(dot64 >= 0.0, uno, -uno)
+    signed_dist = sgn * dist
+    return signed_dist
 end
 
-###################################   Public API   ###################################
+##########################################   Public API   ##########################################
 
 """
-    compute_signed_distance!(out, sd, X, upper_bounds; threaded=true, hint_faces=nothing)
+    compute_signed_distance!(out, sdm, points_mat, upper_bounds², hint_faces)
 
-in-place batch signed distance query and write results into `out`
+In-place batch signed distance query. Writes results into `out`.
+- `out`:            length-n vector to store the output signed distances.
+- `sdm`:            a [`SignedDistanceMesh`] built once via `preprocess_mesh`.
+- `points_mat`:     `3 × n` matrix of query points (Float32 recommended).
+- `upper_bounds²`:  length-n vector of unsigned distance upper bounds per point.
+                    Pass `Inf` for any point without a known bound.
+- `hint_faces`:     length-n vector of *original* face indices (1-based,
+                    matching the input `faces`) for each point.
+                    This uses a single exact triangle check to tighten the upper bound before
+                    BVH traversal, which can substantially speed up near-surface queries.
 
-- `sd`: a `SignedDistanceMesh` built via `preprocess_mesh`
-- `X`: `3 × n` query point matrix
-- `upper_bounds`: length-n vector of unsigned upper bounds, use `Inf` if unknown
-- `hint_faces`: optional length-n vector of original face indices, use 0 for no hint
+Positive = outside, negative = inside.
 
-positive values are outside and negative values are inside
+Notes:
+- The unsigned distance is computed in the geometry type `Tg` (Float32).
+- The *sign decision* (inner product with angle-weighted pseudo-normal) is computed in Float64.
 """
 function compute_signed_distance!(
     out::AbstractVector{Tg},
-    sd::SignedDistanceMesh{Tg,Ts},
-    X::StridedMatrix{Tg},
-    upper_bounds::AbstractVector{Tg};
-    threaded::Bool=true,
-    hint_faces::Union{Nothing,AbstractVector{<:Integer}}=nothing
+    sdm::SignedDistanceMesh{Tg,Ts},
+    points_mat::StridedMatrix{Tg},
+    upper_bounds²::AbstractVector{Tg},
+    hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    @assert size(X, 1) == 3 "X must be 3×n"
-    n_point = size(X, 2)
-    @assert length(out) == n_point
-    @assert length(upper_bounds) == n_point
-    if hint_faces !== nothing
-        @assert length(hint_faces) == n_point
-    end
-    X_vec = reinterpret(Point3{Tg}, vec(X))
-    Threads.@threads :static for i in eachindex(out)
-        tid = Threads.threadid()
+    @assert size(points_mat, 1) == 3 "X must be 3×n"
+    num_points = size(points_mat, 2)
+    @assert length(out) == num_points
+    @assert length(upper_bounds²) == num_points
+    @assert length(hint_faces) == num_points
+
+    stacks = sdm.stacks
+    face_to_packed = sdm.face_to_packed
+    # Zero-copy reinterpret: treat columns of X as Point3{Tg} without allocation
+    points = reinterpret(reshape, Point3{Tg}, points_mat)
+
+    Threads.@threads :static for i in 1:num_points
+        thread_id = Threads.threadid()
+        idx_face = hint_faces[i]
+        idx_face_packed = face_to_packed[idx_face]
         @inbounds out[i] = signed_distance_point(
-            sd,
-            X_vec[i],
-            upper_bounds[i],
-            sd.stacks[tid],
-            Int32(0)
+            sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
         )
     end
     return out
 end
 
 """
-    compute_signed_distance(sd, X, upper_bounds; threaded=true, hint_faces=nothing)
+    compute_signed_distance(sd, X, upper_bounds², hint_faces) → Vector{Tg}
 
-allocating batch signed distance query, see `compute_signed_distance!`
+Allocating batch signed distance query. See `compute_signed_distance!`.
 """
 function compute_signed_distance(
-    sd::SignedDistanceMesh{Tg,Ts},
-    X::StridedMatrix{Tg},
-    upper_bounds::AbstractVector{Tg};
-    threaded::Bool=true,
-    hint_faces::Union{Nothing,AbstractVector{<:Integer}}=nothing
+    sdm::SignedDistanceMesh{Tg,Ts},
+    points::StridedMatrix{Tg},
+    upper_bounds²::AbstractVector{Tg},
+    hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    out = Vector{Tg}(undef, size(X, 2))
-    compute_signed_distance!(out, sd, X, upper_bounds; threaded, hint_faces)
+    num_points = size(points, 2)
+    out = Vector{Tg}(undef, num_points)
+    compute_signed_distance!(out, sdm, points, upper_bounds², hint_faces)
     return out
 end
 
