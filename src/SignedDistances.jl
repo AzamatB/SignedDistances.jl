@@ -104,7 +104,8 @@ function median_split_sort!(
 ) where {Tg<:AbstractFloat}
     sub_indices = @view indices[slice]
     centroids_axis = centroids[axis]
-    sort!(sub_indices; by=tri_idx -> centroids_axis[tri_idx])
+    mid = length(sub_indices) ÷ 2 + 1
+    partialsort!(sub_indices, mid; by=tri_idx -> centroids_axis[tri_idx])
     return indices
 end
 
@@ -214,10 +215,10 @@ function build_bvh(
     ub_x_t::Vector{Tg}, ub_y_t::Vector{Tg}, ub_z_t::Vector{Tg};
     leaf_capacity::Int=8
 ) where {Tg}
-    num_tri = length(first(centroids))
-    tri_indices = Int32.(1:num_tri)
+    num_faces = length(first(centroids))
+    tri_indices = Int32.(1:num_faces)
 
-    max_nodes = 2 * num_tri - 1
+    max_nodes = 2 * ceil(Int, num_faces / leaf_capacity)
     builder = BVHBuilder{Tg}(  # use Tg for BVHBuilder to avoid allocations
         Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
         Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
@@ -226,10 +227,21 @@ function build_bvh(
         Int32(leaf_capacity), Int32(1)
     )
     build_node!(
-        builder, tri_indices, 1, num_tri, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
+        builder, tri_indices, 1, num_faces, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
 
     num_nodes = builder.next_node - 1
+    resize!(builder.lb_x, num_nodes)
+    resize!(builder.lb_y, num_nodes)
+    resize!(builder.lb_z, num_nodes)
+    resize!(builder.ub_x, num_nodes)
+    resize!(builder.ub_y, num_nodes)
+    resize!(builder.ub_z, num_nodes)
+    resize!(builder.left, num_nodes)
+    resize!(builder.right, num_nodes)
+    resize!(builder.leaf_start, num_nodes)
+    resize!(builder.leaf_sizes, num_nodes)
+
     bvh = BoundingVolumeHierarchy{Tg}(
         builder.lb_x, builder.lb_y, builder.lb_z,
         builder.ub_x, builder.ub_y, builder.ub_z,
@@ -253,8 +265,8 @@ end
 Build the acceleration structure for signed-distance queries on a
 watertight, consistently-oriented triangle mesh.
 
-- `vertices`:  `3 × nV` matrix of vertex positions (Float32 recommended).
-- `faces`:     `3 × nF` matrix of 1-based vertex indices.
+- `vertices`:  `3 × num_vertices` matrix of vertex positions (Float32 recommended).
+- `faces`:     `3 × num_faces` matrix of 1-based vertex indices.
 
 `sign_type` controls the floating-point type used for *pseudo-normal sign tests*.
 Using `Float64` is recommended for robustness of the inside/outside sign.
@@ -305,12 +317,12 @@ function preprocess_mesh(
 
     # edge pseudonormals: sum of adjacent unit face normals (unnormalized as only sign matters)
     pns_edge = Matrix{Point3{Ts}}(undef, 3, num_faces)
-    @inbounds for idx_face₁ in eachindex(normals)
+    for idx_face₁ in eachindex(normals)
         normal₁ = normals[idx_face₁]
         for edge in 1:3
             idx_face₂ = face_adjacency[edge, idx_face₁]
-            pseudonormal = (idx_face₂ == 0) ? normal₁ : (normal₁ + normals[idx_face₂])
-            pns_edge[edge, idx_face₁] = pseudonormal
+            normal₂ = normals[idx_face₂]
+            pns_edge[edge, idx_face₁] = normal₁ + normal₂
         end
     end
 
