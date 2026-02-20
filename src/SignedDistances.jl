@@ -412,11 +412,12 @@ function preprocess_mesh(
         ))
     end
 
-    # per-thread stacks (pre-allocated once, reused across all queries)
-    num_threads = Threads.nthreads()
+    # pre-allocated per-chunk traversal stacks (one per parallel chunk, reused across all queries).
+    # we use nthreads(:default) to match the :static scheduler's thread count exactly.
+    num_chunks = Threads.nthreads(:default)
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
     stack_capacity = 2 * tree_height + 4  # small safety margin
-    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_threads]
+    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
     return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed, stacks)
 end
 
@@ -639,18 +640,25 @@ function compute_signed_distance!(
 
     stacks = sdm.stacks
     face_to_packed = sdm.face_to_packed
-    # Zero-copy reinterpret: treat columns of X as Point3{Tg} without allocation
+    # zero-copy reinterpret: treat columns of points_mat as Point3{Tg} without allocation
     points = reinterpret(reshape, Point3{Tg}, points_mat)
 
-    # SAFETY WARNING: :static scheduling is REQUIRED here. threadid() is used to index
-    # pre-allocated per-thread stacks. Switching to :dynamic will cause data races.
-    Threads.@threads :static for i in 1:num_points
-        thread_id = Threads.threadid()
-        idx_face = hint_faces[i]
-        idx_face_packed = face_to_packed[idx_face]
-        @inbounds out[i] = signed_distance_point(
-            sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
-        )
+    # equipartition the work into chunks, so each chunk gets its own pre-allocated stack.
+    # This avoids threadid() entirely, which can exceed nthreads() when
+    # interactive threads are present (threadid() is global across all threadpools).
+    num_chunks = length(stacks)
+    chunk_size = cld(num_points, num_chunks)
+    Threads.@threads :static for idx_chunk in 1:num_chunks
+        stack = stacks[idx_chunk]
+        chunk_start = (idx_chunk - 1) * chunk_size + 1
+        chunk_end = min(idx_chunk * chunk_size, num_points)
+        for idx in chunk_start:chunk_end
+            idx_face = hint_faces[idx]
+            idx_face_packed = face_to_packed[idx_face]
+            @inbounds out[idx] = signed_distance_point(
+                sdm, points[idx], upper_bounds²[idx], stack, idx_face_packed
+            )
+        end
     end
     return out
 end
