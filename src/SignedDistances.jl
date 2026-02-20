@@ -55,10 +55,11 @@ struct TriangleNormals{T<:AbstractFloat}
     normals::NTuple{7,Point3{T}}
 end
 
-# AoS BVH node: all per-node data packed into a single struct.
-# for T=Float32 this is 6×4 + 4×4 = 40 bytes, fitting in one 64-byte cache line.
-# this minimizes cache misses during traversal, where each visited node needs
-# its AABB bounds, child pointers, and leaf metadata in rapid succession.
+# AoS BVH node with overlapped integer fields for cache efficiency.
+# for T=Float32 this is 6×4 + 2×4 = 32 bytes — exactly two nodes per 64-byte cache line.
+# internal and leaf nodes overlap integer fields via sign-bit discriminant:
+#   internal: index = left child,  child_or_size = right child  (both > 0)
+#   leaf:     index = leaf_start,  child_or_size = -leaf_size   (< 0)
 struct BVHNode{T<:AbstractFloat}
     lb_x::T
     lb_y::T
@@ -66,12 +67,8 @@ struct BVHNode{T<:AbstractFloat}
     ub_x::T
     ub_y::T
     ub_z::T
-    left::Int32
-    right::Int32
-    # leaf range start (indexes into packed tri arrays)
-    leaf_start::Int32
-    # leaf size (0 → internal node)
-    leaf_size::Int32
+    index::Int32
+    child_or_size::Int32
 end
 
 struct BoundingVolumeHierarchy{T<:AbstractFloat}
@@ -146,7 +143,7 @@ function build_node!(
     count = hi - lo + 1
     if count <= builder.leaf_capacity
         @inbounds builder.nodes[node_id] = BVHNode{T}(
-            min_x, min_y, min_z, max_x, max_y, max_z, Int32(0), Int32(0), Int32(lo), Int32(count)
+            min_x, min_y, min_z, max_x, max_y, max_z, Int32(lo), -Int32(count)
         )
         return node_id
     end
@@ -183,7 +180,7 @@ function build_node!(
         builder, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
     @inbounds builder.nodes[node_id] = BVHNode{T}(
-        min_x, min_y, min_z, max_x, max_y, max_z, node_left, node_right, Int32(0), Int32(0)
+        min_x, min_y, min_z, max_x, max_y, max_z, node_left, node_right
     )
     return node_id
 end
@@ -398,7 +395,7 @@ end
     @fastmath begin
         zer = zero(Tg)
         (point_x, point_y, point_z) = point
-        @inbounds node = bvh.nodes[node_id]  # single cache-line load (40 bytes for Float32)
+        @inbounds node = bvh.nodes[node_id]  # 32 bytes for Float32 — two nodes per cache line
         Δx = max(node.lb_x - point_x, point_x - node.ub_x, zer)
         Δy = max(node.lb_y - point_y, point_y - node.ub_y, zer)
         Δz = max(node.lb_z - point_z, point_z - node.ub_z, zer)
@@ -510,12 +507,12 @@ end
         (node_dist.dist² > dist²_best) && continue
 
         node = bvh.nodes[node_dist.node_id]
-        leaf_size = node.leaf_size
+        child_or_size = node.child_or_size
 
-        if leaf_size == 0 # internal node
+        if child_or_size > 0 # internal node
             # compute child AABB bounds once, push with stored distances
-            child_l = node.left
-            child_r = node.right
+            child_l = node.index
+            child_r = child_or_size
 
             dist²_l = aabb_dist²(point, bvh, child_l)
             dist²_r = aabb_dist²(point, bvh, child_r)
@@ -536,7 +533,8 @@ end
                 stack[stack_top] = NodeDist{Tg}(child_l, dist²_l)
             end
         else # leaf: test triangles (data is contiguous in packed arrays)
-            leaf_start = node.leaf_start
+            leaf_start = node.index
+            leaf_size = -child_or_size
             leaf_end = leaf_start + leaf_size - Int32(1)
             for idx in leaf_start:leaf_end
                 (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
