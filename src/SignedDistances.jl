@@ -24,7 +24,7 @@ const FEAT_FACE = UInt8(7)   # face interior
 end
 
 @inline function normalize(point::Point3{T}) where {T<:AbstractFloat}
-    ε = nextfloat(Float32)
+    ε = nextfloat(zero(Float32))
     n² = norm²(point)
     c = (n² > ε) * inv(√(n²))
     point_n = c * point
@@ -106,7 +106,7 @@ function median_split_sort!(
     centroids_axis = centroids[axis]
     mid = length(sub_indices) ÷ 2 + 1
     partialsort!(sub_indices, mid; by=tri_idx -> centroids_axis[tri_idx])
-    return indices
+    return nothing
 end
 
 mutable struct BVHBuilder{T}
@@ -647,13 +647,11 @@ function compute_signed_distance!(
     # pre-allocated per-thread stacks. Switching to :dynamic will cause data races.
     Threads.@threads :static for i in 1:num_points
         thread_id = Threads.threadid()
-        @inbounds begin
-            idx_face = hint_faces[i]
-            idx_face_packed = face_to_packed[idx_face]
-            out[i] = signed_distance_point(
-                sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
-            )
-        end
+        idx_face = hint_faces[i]
+        idx_face_packed = face_to_packed[idx_face]
+        @inbounds out[i] = signed_distance_point(
+            sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
+        )
     end
     return out
 end
