@@ -102,15 +102,12 @@ end
 
 # partial sort of indices by centroid along axis (build-time only)
 function median_split_sort!(
-    indices::Vector{Int32},
-    slice::AbstractUnitRange{Int},
-    centroids::NTuple{3,Vector{Tg}},
-    axis::Int
+    indices::Vector{Int32}, lo::Int, mid::Int, hi::Int, centroids::NTuple{3,Vector{Tg}}, axis::Int
 ) where {Tg<:AbstractFloat}
-    sub_indices = @view indices[slice]
+    sub_indices = @view indices[lo:hi]
     centroids_axis = centroids[axis]
-    mid = length(sub_indices) ÷ 2 + 1
-    partialsort!(sub_indices, mid; by=tri_idx -> centroids_axis[tri_idx])
+    mid_relative = mid - lo + 1
+    partialsort!(sub_indices, mid_relative; by=tri_idx -> centroids_axis[tri_idx])
     return nothing
 end
 
@@ -177,7 +174,7 @@ function build_node!(
 
     mid = (lo + hi) >>> 1   # (lo + hi) ÷ 2
     # median split via partial sort (skip if all centroids identical along all axes)
-    (spread_max > 0) && median_split_sort!(tri_indices, lo:hi, centroids, axis)
+    (spread_max > 0) && median_split_sort!(tri_indices, lo, mid, hi, centroids, axis)
 
     node_left = build_node!(
         builder, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
@@ -460,7 +457,10 @@ end
         return (norm²(Δ), Δ, FEAT_E23)
     end
 
-    denom = inv(va + vb + vc)
+    denom_sum = va + vb + vc
+    # fallback for degenerate triangles to avoid NaN
+    iszero(denom_sum) && return (norm²(ap), ap, FEAT_V1)
+    denom = inv(denom_sum)
     v = vb * denom
     w = vc * denom
     Δ = ap - v * ab - w * ac
