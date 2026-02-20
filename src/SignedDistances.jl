@@ -539,8 +539,8 @@ end
         node = node_dist.node
         num_triangles = bvh.leaf_sizes[node]
 
-        if num_triangles == 0
-            # internal: compute child AABB bounds once, push with stored distances
+        if num_triangles == 0 # internal node
+            # compute child AABB bounds once, push with stored distances
             child_l = bvh.left[node]
             child_r = bvh.right[node]
 
@@ -554,10 +554,10 @@ end
             end
 
             # ensure room for up to 2 pushes
-            len = length(stack)
-            if (len - stack_top) < 2
-                resize!(stack, max(stack_top + 2, 2 * len))
-            end
+            # len = length(stack)
+            # if (len - stack_top) < 2
+            #     resize!(stack, max(stack_top + 2, 2 * len))
+            # end
 
             # push far, then near
             if dist²_r <= dist²_best
@@ -583,7 +583,7 @@ end
         end
     end
 
-    @assert !iszero(tri_best)
+    iszero(tri_best) && error("No triangle found")
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
@@ -641,13 +641,17 @@ function compute_signed_distance!(
     # Zero-copy reinterpret: treat columns of X as Point3{Tg} without allocation
     points = reinterpret(reshape, Point3{Tg}, points_mat)
 
+    # SAFETY WARNING: :static scheduling is REQUIRED here. threadid() is used to index
+    # pre-allocated per-thread stacks. Switching to :dynamic will cause data races.
     Threads.@threads :static for i in 1:num_points
         thread_id = Threads.threadid()
-        idx_face = hint_faces[i]
-        idx_face_packed = face_to_packed[idx_face]
-        @inbounds out[i] = signed_distance_point(
-            sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
-        )
+        @inbounds begin
+            idx_face = hint_faces[i]
+            idx_face_packed = face_to_packed[idx_face]
+            out[i] = signed_distance_point(
+                sdm, points[i], upper_bounds²[i], stacks[thread_id], idx_face_packed
+            )
+        end
     end
     return out
 end
