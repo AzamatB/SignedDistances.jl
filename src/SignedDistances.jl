@@ -260,15 +260,14 @@ end
 end
 
 """
-    preprocess_mesh(vertices, faces; leaf_capacity=8, stack_capacity=256, sign_type=Float64)
+    preprocess_mesh(mesh::Mesh{3,Float32,GLTriangleFace}; leaf_capacity=8, sign_type=Float64)
 
 Build the acceleration structure for signed-distance queries on a
 watertight, consistently-oriented triangle mesh.
 
-- `vertices`:  `3 × num_vertices` matrix of vertex positions (Float32 recommended).
-- `faces`:     `3 × num_faces` matrix of 1-based vertex indices.
+- `mesh`:  `Mesh{3,Float32,GLTriangleFace}` closed, watertight, consistently-oriented triangle mesh.
 
-`sign_type` controls the floating-point type used for *pseudo-normal sign tests*.
+`sign_type` controls the floating-point type used for pseudonormal sign tests.
 Using `Float64` is recommended for robustness of the inside/outside sign.
 
 Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls.
@@ -657,7 +656,7 @@ function compute_signed_distance!(
 end
 
 """
-    compute_signed_distance(sd, X, upper_bounds², hint_faces) → Vector{Tg}
+    compute_signed_distance(sdm, points, upper_bounds², hint_faces) → Vector{Tg}
 
 Allocating batch signed distance query. See `compute_signed_distance!`.
 """
