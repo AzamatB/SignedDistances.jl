@@ -265,7 +265,7 @@ function preprocess_mesh(
             end
         end
     end
-    @assert isempty(neighbors) "mesh is not watertight: $(length(neighbors)) boundary edges"
+    isempty(neighbors) || throw(ArgumentError("Mesh is not watertight: $(length(neighbors)) boundary edges"))
 
     # edge pseudonormals: sum of adjacent unit face normals (unnormalized as only sign matters)
     pns_edge = Matrix{Point3{Ts}}(undef, 3, num_faces)
