@@ -26,7 +26,7 @@ end
 @inline function normalize(point::Point3{T}) where {T<:AbstractFloat}
     ε = nextfloat(zero(Float32))
     n² = norm²(point)
-    c = (n² > ε) * inv(√(n²))
+    c = ifelse(n² > ε, inv(√(n²)), zero(T))
     point_n = c * point
     return point_n::Point3{T}
 end
@@ -218,7 +218,7 @@ function build_bvh(
     num_faces = length(first(centroids))
     tri_indices = Int32.(1:num_faces)
 
-    max_nodes = 2 * ceil(Int, num_faces / leaf_capacity)
+    max_nodes = 2 * num_faces
     builder = BVHBuilder{Tg}(  # use Tg for BVHBuilder to avoid allocations
         Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
         Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
@@ -273,8 +273,7 @@ Using `Float64` is recommended for robustness of the inside/outside sign.
 Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls.
 """
 function preprocess_mesh(
-    mesh::Mesh{3,Float32,GLTriangleFace};
-    leaf_capacity::Int=8, sign_type::Type{Ts}=Float64
+    mesh::Mesh{3,Float32,GLTriangleFace}, sign_type::Type{Ts}=Float64; leaf_capacity::Int=8
 ) where {Ts<:AbstractFloat}
     Tg = Float32
     vertices = GeometryBasics.coordinates(mesh)
