@@ -89,8 +89,6 @@ struct SignedDistanceMesh{Tg<:AbstractFloat,Ts<:AbstractFloat}
     # face_to_packed[f] = packed triangle index for original face id f
     # (used to exploit your “source triangle” hints)
     face_to_packed::Vector{Int32}
-    # pre-allocated per-thread traversal stacks (avoid allocations in hot loop)
-    stacks::Vector{Vector{NodeDist{Tg}}}
 end
 
 #######################################   BVH Construction   #######################################
@@ -411,19 +409,25 @@ function preprocess_mesh(
         ))
     end
 
-    # pre-allocated per-chunk traversal stacks (one per parallel chunk, reused across all queries).
-    # we use nthreads(:default) to match the :static scheduler's thread count exactly.
-    num_chunks = Threads.nthreads(:default)
-    tree_height = calculate_tree_height(num_faces, leaf_capacity)
-    stack_capacity = 2 * tree_height + 4  # small safety margin
-    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
-    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed, stacks)
+    return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed)
 end
 
-function calculate_tree_height(num_faces::Int, leaf_capacity::Int)
+function calculate_tree_height(num_faces::Integer, leaf_capacity::Integer)
     num_leaves = max(ceil(num_faces / leaf_capacity), 1.0)
     tree_height = ceil(Int, log2(num_leaves))
     return tree_height::Int
+end
+
+# allocate one traversal stack per chunk (one per :default thread).
+# each stack is tiny (~256 bytes for 100k triangles), so per-call allocation is negligible.
+function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}) where {Tg,Ts}
+    num_faces = length(sdm.tri_geometries)
+    leaf_capacity = sdm.bvh.leaf_capacity
+    tree_height = calculate_tree_height(num_faces, leaf_capacity)
+    stack_capacity = 2 * tree_height + 4  # small safety margin
+    num_chunks = Threads.nthreads(:default)
+    stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
+    return stacks
 end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
@@ -637,14 +641,14 @@ function compute_signed_distance!(
     @assert length(upper_bounds²) == num_points
     @assert length(hint_faces) == num_points
 
-    stacks = sdm.stacks
     face_to_packed = sdm.face_to_packed
     # zero-copy reinterpret: treat columns of points_mat as Point3{Tg} without allocation
     points = reinterpret(reshape, Point3{Tg}, points_mat)
+    stacks = allocate_stacks(sdm)
 
-    # equipartition the work into chunks, so each chunk gets its own pre-allocated stack.
-    # This avoids threadid() entirely, which can exceed nthreads() when
-    # interactive threads are present (threadid() is global across all threadpools).
+    # equipartition the work into chunks, so each chunk gets its own stack.
+    # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
+    # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
     Threads.@threads :static for idx_chunk in 1:num_chunks
