@@ -561,12 +561,6 @@ end
                 (dist²_l, dist²_r) = (dist²_r, dist²_l)
             end
 
-            # ensure room for up to 2 pushes
-            # len = length(stack)
-            # if (len - stack_top) < 2
-            #     resize!(stack, max(stack_top + 2, 2 * len))
-            # end
-
             # push far, then near
             if dist²_r <= dist²_best
                 stack_top += 1
