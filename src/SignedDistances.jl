@@ -203,9 +203,7 @@ function build_bvh(
         builder, tri_indices, 1, num_faces, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
     num_nodes = builder.next_node - 1
-    resize!(builder.nodes, num_nodes)
-
-    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes, builder.leaf_capacity, num_nodes)
+    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes[1:num_nodes], builder.leaf_capacity, num_nodes)
     return (bvh, tri_indices)  # return triangle order for packing
 end
 
