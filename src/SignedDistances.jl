@@ -95,7 +95,7 @@ end
 
 #######################################   BVH Construction   #######################################
 
-# full sort of indices by centroid along axis (build-time only)
+# partial sort of indices by centroid along axis (build-time only)
 function median_split_sort!(
     indices::Vector{Int32},
     slice::AbstractUnitRange{Int},
@@ -191,7 +191,7 @@ function build_node!(
     (spread_max, axis) = findmax((spread_x, spread_y, spread_z))
 
     mid = (lo + hi) >>> 1   # (lo + hi) ÷ 2
-    # median split via full sort (skip if all centroids identical along all axes)
+    # median split via partial sort (skip if all centroids identical along all axes)
     (spread_max > 0) && median_split_sort!(tri_indices, lo:hi, centroids, axis)
 
     leftnode = build_node!(
@@ -275,7 +275,7 @@ Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls
 """
 function preprocess_mesh(
     mesh::Mesh{3,Float32,GLTriangleFace};
-    leaf_capacity::Int=8, stack_capacity::Int=256, sign_type::Type{Ts}=Float64
+    leaf_capacity::Int=8, sign_type::Type{Ts}=Float64
 ) where {Ts<:AbstractFloat}
     Tg = Float32
     vertices = GeometryBasics.coordinates(mesh)
@@ -415,8 +415,16 @@ function preprocess_mesh(
 
     # per-thread stacks (pre-allocated once, reused across all queries)
     num_threads = Threads.nthreads()
+    tree_height = calculate_tree_height(num_faces, leaf_capacity)
+    stack_capacity = 2 * tree_height + 4  # small safety margin
     stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_threads]
     return SignedDistanceMesh{Tg,Ts}(tri_geometries, tri_normals, bvh, face_to_packed, stacks)
+end
+
+function calculate_tree_height(num_faces::Int, leaf_capacity::Int)
+    num_leaves = max(ceil(num_faces / leaf_capacity), 1.0)
+    tree_height = ceil(Int, log2(num_leaves))
+    return tree_height::Int
 end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
@@ -630,7 +638,7 @@ function compute_signed_distance!(
     upper_bounds²::AbstractVector{Tg},
     hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    @assert size(points_mat, 1) == 3 "X must be 3×n"
+    @assert size(points_mat, 1) == 3 "points matrix must be 3×n"
     num_points = size(points_mat, 2)
     @assert length(out) == num_points
     @assert length(upper_bounds²) == num_points
