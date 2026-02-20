@@ -544,7 +544,7 @@ end
         end
     end
 
-    iszero(tri_best) && error("No triangle found")
+    iszero(tri_best) && return Tg(NaN)
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
@@ -587,19 +587,17 @@ Notes:
 function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg,Ts},
-    points_mat::StridedMatrix{Tg},
+    points::AbstractMatrix{Tg},
     upper_bounds²::AbstractVector{Tg},
     hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    @assert size(points_mat, 1) == 3 "points matrix must be 3×n"
-    num_points = size(points_mat, 2)
+    @assert size(points, 1) == 3 "points matrix must be 3×n"
+    num_points = size(points, 2)
     @assert length(out) == num_points
     @assert length(upper_bounds²) == num_points
     @assert length(hint_faces) == num_points
 
     face_to_packed = sdm.face_to_packed
-    # zero-copy reinterpret: treat columns of points_mat as Point3{Tg} without allocation
-    points = reinterpret(reshape, Point3{Tg}, points_mat)
     stacks = allocate_stacks(sdm)
 
     # equipartition the work into chunks, so each chunk gets its own stack.
@@ -614,8 +612,9 @@ function compute_signed_distance!(
         for idx in chunk_start:chunk_end
             idx_face = hint_faces[idx]
             idx_face_packed = face_to_packed[idx_face]
+            @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
             @inbounds out[idx] = signed_distance_point(
-                sdm, points[idx], upper_bounds²[idx], stack, idx_face_packed
+                sdm, point, upper_bounds²[idx], stack, idx_face_packed
             )
         end
     end
