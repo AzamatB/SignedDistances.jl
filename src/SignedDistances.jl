@@ -249,6 +249,7 @@ function preprocess_mesh(
     # face_adjacency[edge, face] = index of the face sharing local `edge` of `face` (0 if boundary)
     face_adjacency = zeros(Int32, 3, num_faces)
     neighbors = Dict{UInt64,Tuple{Int32,Int32}}()
+    sizehint!(neighbors, 3 * num_faces)
     @inbounds for idx_face in eachindex(faces)
         (idx_v1, idx_v2, idx_v3) = faces[idx_face]
         for (edge, vertex_a, vertex_b) in ((Int32(1), idx_v1, idx_v2), (Int32(2), idx_v2, idx_v3), (Int32(3), idx_v3, idx_v1))
@@ -591,7 +592,7 @@ Notes:
 function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg,Ts},
-    points::AbstractMatrix{Tg},
+    points::StridedMatrix{Tg},
     upper_bounds²::AbstractVector{Tg},
     hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
