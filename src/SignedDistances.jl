@@ -55,20 +55,27 @@ struct TriangleNormals{T<:AbstractFloat}
     normals::NTuple{7,Point3{T}}
 end
 
-# BVH with SoA layout (each field is a separate array for minimal cache-footprint during pruning)
-struct BoundingVolumeHierarchy{T<:AbstractFloat}
-    lb_x::Vector{T}
-    lb_y::Vector{T}
-    lb_z::Vector{T}
-    ub_x::Vector{T}
-    ub_y::Vector{T}
-    ub_z::Vector{T}
-    left::Vector{Int32}
-    right::Vector{Int32}
+# AoS BVH node: all per-node data packed into a single struct.
+# for T=Float32 this is 6×4 + 4×4 = 40 bytes, fitting in one 64-byte cache line.
+# this minimizes cache misses during traversal, where each visited node needs
+# its AABB bounds, child pointers, and leaf metadata in rapid succession.
+struct BVHNode{T<:AbstractFloat}
+    lb_x::T
+    lb_y::T
+    lb_z::T
+    ub_x::T
+    ub_y::T
+    ub_z::T
+    left::Int32
+    right::Int32
     # leaf range start (indexes into packed tri arrays)
-    leaf_start::Vector{Int32}
+    leaf_start::Int32
     # leaf size (0 → internal node)
-    leaf_sizes::Vector{Int32}
+    leaf_size::Int32
+end
+
+struct BoundingVolumeHierarchy{T<:AbstractFloat}
+    nodes::Vector{BVHNode{T}}
     leaf_capacity::Int32
     num_nodes::Int32
 end
@@ -76,7 +83,7 @@ end
 # stack element carrying both node id and its already-computed AABB lower bound.
 # this avoids recomputing aabb_dist² again when the node is popped.
 struct NodeDist{T<:AbstractFloat}
-    node::Int32
+    node_id::Int32
     dist²::T
 end
 
@@ -108,16 +115,7 @@ function median_split_sort!(
 end
 
 mutable struct BVHBuilder{T}
-    const lb_x::Vector{T}
-    const lb_y::Vector{T}
-    const lb_z::Vector{T}
-    const ub_x::Vector{T}
-    const ub_y::Vector{T}
-    const ub_z::Vector{T}
-    const left::Vector{Int32}
-    const right::Vector{Int32}
-    const leaf_start::Vector{Int32}
-    const leaf_sizes::Vector{Int32}
+    const nodes::Vector{BVHNode{T}}
     const leaf_capacity::Int32
     next_node::Int32
 end
@@ -128,7 +126,7 @@ function build_node!(
     lb_x_t::Vector{T}, lb_y_t::Vector{T}, lb_z_t::Vector{T},
     ub_x_t::Vector{T}, ub_y_t::Vector{T}, ub_z_t::Vector{T},
 ) where {T}
-    node = builder.next_node
+    node_id = builder.next_node
     builder.next_node += 1
 
     # compute node bounds
@@ -138,33 +136,22 @@ function build_node!(
     max_x = -T(Inf)
     max_y = -T(Inf)
     max_z = -T(Inf)
-    @inbounds begin
-        for i in lo:hi
-            t = tri_indices[i]
-            min_x = min(min_x, lb_x_t[t])
-            min_y = min(min_y, lb_y_t[t])
-            min_z = min(min_z, lb_z_t[t])
-            max_x = max(max_x, ub_x_t[t])
-            max_y = max(max_y, ub_y_t[t])
-            max_z = max(max_z, ub_z_t[t])
-        end
-        builder.lb_x[node] = min_x
-        builder.lb_y[node] = min_y
-        builder.lb_z[node] = min_z
-        builder.ub_x[node] = max_x
-        builder.ub_y[node] = max_y
-        builder.ub_z[node] = max_z
+    @inbounds for i in lo:hi
+        idx_face = tri_indices[i]
+        min_x = min(min_x, lb_x_t[idx_face])
+        min_y = min(min_y, lb_y_t[idx_face])
+        min_z = min(min_z, lb_z_t[idx_face])
+        max_x = max(max_x, ub_x_t[idx_face])
+        max_y = max(max_y, ub_y_t[idx_face])
+        max_z = max(max_z, ub_z_t[idx_face])
     end
 
-    n = hi - lo + 1
-    if n <= builder.leaf_capacity
-        @inbounds begin
-            builder.left[node] = 0
-            builder.right[node] = 0
-            builder.leaf_start[node] = Int32(lo)
-            builder.leaf_sizes[node] = Int32(n)
-        end
-        return node
+    count = hi - lo + 1
+    if count <= builder.leaf_capacity
+        @inbounds builder.nodes[node_id] = BVHNode{T}(
+            min_x, min_y, min_z, max_x, max_y, max_z, Int32(0), Int32(0), Int32(lo), Int32(count)
+        )
+        return node_id
     end
 
     # split axis = longest centroid extent
@@ -192,19 +179,16 @@ function build_node!(
     # median split via partial sort (skip if all centroids identical along all axes)
     (spread_max > 0) && median_split_sort!(tri_indices, lo:hi, centroids, axis)
 
-    leftnode = build_node!(
+    node_left = build_node!(
         builder, tri_indices, lo, mid, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
-    rightnode = build_node!(
+    node_right = build_node!(
         builder, tri_indices, mid + 1, hi, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
-    @inbounds begin
-        builder.left[node] = leftnode
-        builder.right[node] = rightnode
-        builder.leaf_start[node] = 0
-        builder.leaf_sizes[node] = 0
-    end
-    return node
+    @inbounds builder.nodes[node_id] = BVHNode{T}(
+        min_x, min_y, min_z, max_x, max_y, max_z, node_left, node_right, Int32(0), Int32(0)
+    )
+    return node_id
 end
 
 function build_bvh(
@@ -217,35 +201,14 @@ function build_bvh(
     tri_indices = Int32.(1:num_faces)
 
     max_nodes = 2 * num_faces
-    builder = BVHBuilder{Tg}(  # use Tg for BVHBuilder to avoid allocations
-        Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
-        Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes), Vector{Tg}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes), Vector{Int32}(undef, max_nodes),
-        Vector{Int32}(undef, max_nodes), Vector{Int32}(undef, max_nodes),
-        Int32(leaf_capacity), Int32(1)
-    )
+    builder = BVHBuilder{Tg}(Vector{BVHNode{Tg}}(undef, max_nodes), Int32(leaf_capacity), Int32(1))
     build_node!(
         builder, tri_indices, 1, num_faces, centroids, lb_x_t, lb_y_t, lb_z_t, ub_x_t, ub_y_t, ub_z_t
     )
-
     num_nodes = builder.next_node - 1
-    resize!(builder.lb_x, num_nodes)
-    resize!(builder.lb_y, num_nodes)
-    resize!(builder.lb_z, num_nodes)
-    resize!(builder.ub_x, num_nodes)
-    resize!(builder.ub_y, num_nodes)
-    resize!(builder.ub_z, num_nodes)
-    resize!(builder.left, num_nodes)
-    resize!(builder.right, num_nodes)
-    resize!(builder.leaf_start, num_nodes)
-    resize!(builder.leaf_sizes, num_nodes)
+    resize!(builder.nodes, num_nodes)
 
-    bvh = BoundingVolumeHierarchy{Tg}(
-        builder.lb_x, builder.lb_y, builder.lb_z,
-        builder.ub_x, builder.ub_y, builder.ub_z,
-        builder.left, builder.right, builder.leaf_start, builder.leaf_sizes,
-        builder.leaf_capacity, num_nodes
-    )
+    bvh = BoundingVolumeHierarchy{Tg}(builder.nodes, builder.leaf_capacity, num_nodes)
     return (bvh, tri_indices)  # return triangle order for packing
 end
 
@@ -432,23 +395,16 @@ end
 
 ##############################   High-Performance Hot Loop Routines   ##############################
 
-# AABB squared distance with single bound load + branchless clamp
+# AABB squared distance: single node load + branchless clamp
 @inline function aabb_dist²(
     point::Point3{Tg}, bvh::BoundingVolumeHierarchy{Tg}, node_id::Int32
 ) where {Tg}
     (point_x, point_y, point_z) = point
-    @inbounds begin
-        lb_x = bvh.lb_x[node_id]
-        ub_x = bvh.ub_x[node_id]
-        lb_y = bvh.lb_y[node_id]
-        ub_y = bvh.ub_y[node_id]
-        lb_z = bvh.lb_z[node_id]
-        ub_z = bvh.ub_z[node_id]
-    end
+    @inbounds node = bvh.nodes[node_id]  # single cache-line load (40 bytes for Float32)
     zer = zero(Tg)
-    Δx = max(lb_x - point_x, point_x - ub_x, zer)
-    Δy = max(lb_y - point_y, point_y - ub_y, zer)
-    Δz = max(lb_z - point_z, point_z - ub_z, zer)
+    Δx = max(node.lb_x - point_x, point_x - node.ub_x, zer)
+    Δy = max(node.lb_y - point_y, point_y - node.ub_y, zer)
+    Δz = max(node.lb_z - point_z, point_z - node.ub_z, zer)
     dist² = Δx * Δx + Δy * Δy + Δz * Δz
     return dist²
 end
@@ -547,13 +503,13 @@ end
 
         (node_dist.dist² > dist²_best) && continue
 
-        node = node_dist.node
-        num_triangles = bvh.leaf_sizes[node]
+        node = bvh.nodes[node_dist.node_id]
+        leaf_size = node.leaf_size
 
-        if num_triangles == 0 # internal node
+        if leaf_size == 0 # internal node
             # compute child AABB bounds once, push with stored distances
-            child_l = bvh.left[node]
-            child_r = bvh.right[node]
+            child_l = node.left
+            child_r = node.right
 
             dist²_l = aabb_dist²(point, bvh, child_l)
             dist²_r = aabb_dist²(point, bvh, child_r)
@@ -574,8 +530,8 @@ end
                 stack[stack_top] = NodeDist{Tg}(child_l, dist²_l)
             end
         else # leaf: test triangles (data is contiguous in packed arrays)
-            leaf_start = bvh.leaf_start[node]
-            leaf_end = leaf_start + num_triangles - Int32(1)
+            leaf_start = node.leaf_start
+            leaf_end = leaf_start + leaf_size - Int32(1)
             for idx in leaf_start:leaf_end
                 (dist², Δ, feat) = closest_diff_triangle(point, tri_geometries[idx])
                 if dist² < dist²_best
