@@ -326,7 +326,7 @@ function preprocess_mesh(
         ub_y_t[idx_face] = max(y1, y2, y3)
         ub_z_t[idx_face] = max(z1, z2, z3)
 
-        centroid = (v1 + v2 + v3) / Tg(3)
+        centroid = (v1 + v2 + v3) / 3
         centroids_x[idx_face] = centroid[1]
         centroids_y[idx_face] = centroid[2]
         centroids_z[idx_face] = centroid[3]
@@ -426,9 +426,10 @@ end
         return (norm²(bp), bp, FEAT_V2)
     end
 
+    ε = nextfloat(zero(Tg))
     vc = d1 * d4 - d3 * d2
     d13 = d1 - d3
-    if (vc <= 0) && (d1 >= 0) && (d3 <= 0) && (d13 > 0)
+    if (vc <= 0) && (d1 >= 0) && (d3 <= 0) && (d13 > ε)
         v = d1 / d13   # bary: (1-v, v, 0)
         Δ = ap - v * ab      # p - (a + v*ab)
         return (norm²(Δ), Δ, FEAT_E12)
@@ -443,7 +444,7 @@ end
 
     vb = d5 * d2 - d1 * d6
     d26 = d2 - d6
-    if (vb <= 0) && (d2 >= 0) && (d6 <= 0) && (d26 > 0)
+    if (vb <= 0) && (d2 >= 0) && (d6 <= 0) && (d26 > ε)
         w = d2 / d26   # bary: (1-w, 0, w)
         Δ = ap - w * ac      # p - (a + w*ac)
         return (norm²(Δ), Δ, FEAT_E31)
@@ -453,7 +454,7 @@ end
     d43 = d4 - d3
     d56 = d5 - d6
     denom_sum = d43 + d56
-    if (va <= 0) && (d43 >= 0) && (d56 >= 0) && (denom_sum > 0)
+    if (va <= 0) && (d43 >= 0) && (d56 >= 0) && (denom_sum > ε)
         w = d43 / denom_sum  # bary: (0, 1-w, w)
         bc = ac - ab
         Δ = bp - w * bc
@@ -462,7 +463,7 @@ end
 
     denom_sum = va + vb + vc
     # fallback for degenerate triangles to avoid NaN
-    iszero(denom_sum) && return (norm²(ap), ap, FEAT_V1)
+    (denom_sum > ε) || return (norm²(ap), ap, FEAT_V1)
     denom = inv(denom_sum)
     v = vb * denom
     w = vc * denom
@@ -610,7 +611,7 @@ function compute_signed_distance!(
     # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
-    Threads.@threads for idx_chunk in 1:num_chunks
+    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
         stack = stacks[idx_chunk]
         chunk_start = (idx_chunk - 1) * chunk_size + 1
         chunk_end = min(idx_chunk * chunk_size, num_points)
