@@ -24,7 +24,7 @@ const FEAT_FACE = UInt8(7)   # face interior
 end
 
 @inline function normalize(point::Point3{T}) where {T<:AbstractFloat}
-    ε = nextfloat(zero(Float32))
+    ε = nextfloat(zero(T))
     n² = norm²(point)
     c = ifelse(n² > ε, inv(√(n²)), zero(T))
     point_n = c * point
@@ -385,7 +385,8 @@ function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}) where {Tg,Ts}
     leaf_capacity = sdm.bvh.leaf_capacity
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
     stack_capacity = 2 * tree_height + 4  # small safety margin
-    num_chunks = Threads.nthreads(:default)
+    # oversubscribe the chunks to take advantage of work stealing scheduler
+    num_chunks = Threads.nthreads(:default) * 4
     stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
     return stacks
 end
@@ -396,13 +397,15 @@ end
 @inline function aabb_dist²(
     point::Point3{Tg}, bvh::BoundingVolumeHierarchy{Tg}, node_id::Int32
 ) where {Tg}
-    (point_x, point_y, point_z) = point
-    @inbounds node = bvh.nodes[node_id]  # single cache-line load (40 bytes for Float32)
-    zer = zero(Tg)
-    Δx = max(node.lb_x - point_x, point_x - node.ub_x, zer)
-    Δy = max(node.lb_y - point_y, point_y - node.ub_y, zer)
-    Δz = max(node.lb_z - point_z, point_z - node.ub_z, zer)
-    dist² = Δx * Δx + Δy * Δy + Δz * Δz
+    @fastmath begin
+        zer = zero(Tg)
+        (point_x, point_y, point_z) = point
+        @inbounds node = bvh.nodes[node_id]  # single cache-line load (40 bytes for Float32)
+        Δx = max(node.lb_x - point_x, point_x - node.ub_x, zer)
+        Δy = max(node.lb_y - point_y, point_y - node.ub_y, zer)
+        Δz = max(node.lb_z - point_z, point_z - node.ub_z, zer)
+        dist² = Δx * Δx + Δy * Δy + Δz * Δz
+    end
     return dist²
 end
 
@@ -428,8 +431,9 @@ end
     end
 
     vc = d1 * d4 - d3 * d2
-    if (vc <= 0) && (d1 >= 0) && (d3 <= 0)
-        v = d1 / (d1 - d3)   # bary: (1-v, v, 0)
+    d13 = d1 - d3
+    if (vc <= 0) && (d1 >= 0) && (d3 <= 0) && (d13 > 0)
+        v = d1 / d13   # bary: (1-v, v, 0)
         Δ = ap - v * ab      # p - (a + v*ab)
         return (norm²(Δ), Δ, FEAT_E12)
     end
@@ -442,16 +446,19 @@ end
     end
 
     vb = d5 * d2 - d1 * d6
-    if (vb <= 0) && (d2 >= 0) && (d6 <= 0)
-        w = d2 / (d2 - d6)   # bary: (1-w, 0, w)
+    d26 = d2 - d6
+    if (vb <= 0) && (d2 >= 0) && (d6 <= 0) && (d26 > 0)
+        w = d2 / d26   # bary: (1-w, 0, w)
         Δ = ap - w * ac      # p - (a + w*ac)
         return (norm²(Δ), Δ, FEAT_E31)
     end
 
     va = d3 * d6 - d5 * d4
-    if (va <= 0) && (d4 - d3) >= 0 && (d5 - d6) >= 0
-        d43 = d4 - d3
-        w = d43 / (d43 + d5 - d6)  # bary: (0, 1-w, w)
+    d43 = d4 - d3
+    d56 = d5 - d6
+    denom_sum = d43 + d56
+    if (va <= 0) && (d43 >= 0) && (d56 >= 0) && (denom_sum > 0)
+        w = d43 / denom_sum  # bary: (0, 1-w, w)
         bc = ac - ab
         Δ = bp - w * bc
         return (norm²(Δ), Δ, FEAT_E23)
@@ -491,6 +498,7 @@ end
         feat_best = feat_hint
         tri_best = hint_face
     end
+    (dist²_best <= 0) && return zero(Tg)
 
     bvh = sdm.bvh
     stack_top = 1
@@ -605,7 +613,7 @@ function compute_signed_distance!(
     # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
-    Threads.@threads :static for idx_chunk in 1:num_chunks
+    Threads.@threads for idx_chunk in 1:num_chunks
         stack = stacks[idx_chunk]
         chunk_start = (idx_chunk - 1) * chunk_size + 1
         chunk_end = min(idx_chunk * chunk_size, num_points)
