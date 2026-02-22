@@ -383,15 +383,28 @@ function calculate_tree_height(num_faces::Integer, leaf_capacity::Integer)
     return tree_height::Int
 end
 
-# allocate one traversal stack per chunk (one per :default thread).
-# each stack is tiny (~256 bytes for 100k triangles), so per-call allocation is negligible.
-function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}) where {Tg,Ts}
+# allocate one traversal stack per chunk
+# each stack is tiny (~256 bytes for 100k triangles), so per-call allocation is negligible
+function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}, num_points::Int) where {Tg,Ts}
     num_faces = length(sdm.tri_geometries)
     leaf_capacity = sdm.bvh.leaf_capacity
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
-    stack_capacity = 2 * tree_height + 4  # small safety margin
-    # oversubscribe the chunks for stride-based load balancing
-    num_chunks = Threads.nthreads() * 8
+    stack_capacity = 2 * tree_height + 4
+    n_threads = Threads.nthreads()
+    # enforce a minimum chunk size to prevent false sharing and guarantee cache locality.
+    min_chunk_size = 512
+    num_chunks_max = max(1, num_points ÷ min_chunk_size)
+
+    if num_chunks_max < n_threads
+        # array is too small to use all threads optimally, limit the chunks
+        num_chunks = num_chunks_max
+    else # array is large enough to target ideal 8x oversubscription
+        factor_max = 8
+        factor = min(factor_max, num_chunks_max ÷ n_threads)
+        # set num_chunks to an exact multiple of n_threads for even load distribution over all cores
+        num_chunks = n_threads * factor
+    end
+
     stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
     return stacks
 end
@@ -618,7 +631,7 @@ function compute_signed_distance!(
     @assert size(points, 1) == 3 "points matrix must be 3×n"
 
     face_to_packed = sdm.face_to_packed
-    stacks = allocate_stacks(sdm)
+    stacks = allocate_stacks(sdm, num_points)
     # equipartition the work into chunks, so each chunk gets its own stack.
     # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
     # concurrent callers on the same sdm never share mutable scratch space.
@@ -645,7 +658,7 @@ function compute_signed_distance!(
     @assert length(out) == num_points
     @assert size(points, 1) == 3 "points matrix must be 3×n"
 
-    stacks = allocate_stacks(sdm)
+    stacks = allocate_stacks(sdm, num_points)
     # equipartition the work into chunks, so each chunk gets its own stack.
     # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
     # concurrent callers on the same sdm never share mutable scratch space.
