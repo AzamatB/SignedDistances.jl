@@ -1,6 +1,6 @@
 module SignedDistances
 
-using Base.Threads
+using Polyester
 using GeometryBasics
 using LinearAlgebra
 
@@ -390,8 +390,8 @@ function allocate_stacks(sdm::SignedDistanceMesh{Tg,Ts}) where {Tg,Ts}
     leaf_capacity = sdm.bvh.leaf_capacity
     tree_height = calculate_tree_height(num_faces, leaf_capacity)
     stack_capacity = 2 * tree_height + 4  # small safety margin
-    # oversubscribe the chunks to take advantage of work stealing scheduler
-    num_chunks = Threads.nthreads(:default) * 4
+    # oversubscribe the chunks for stride-based load balancing
+    num_chunks = Threads.nthreads() * 8
     stacks = [Vector{NodeDist{Tg}}(undef, stack_capacity) for _ in 1:num_chunks]
     return stacks
 end
@@ -624,7 +624,7 @@ function compute_signed_distance!(
     # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
-    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
+    @batch stride = true for idx_chunk in 1:num_chunks
         stack = stacks[idx_chunk]
         chunk_start = (idx_chunk - 1) * chunk_size + 1
         chunk_end = min(idx_chunk * chunk_size, num_points)
@@ -651,7 +651,7 @@ function compute_signed_distance!(
     # concurrent callers on the same sdm never share mutable scratch space.
     num_chunks = length(stacks)
     chunk_size = cld(num_points, num_chunks)
-    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
+    @batch stride = true for idx_chunk in 1:num_chunks
         stack = stacks[idx_chunk]
         chunk_start = (idx_chunk - 1) * chunk_size + 1
         chunk_end = min(idx_chunk * chunk_size, num_points)
