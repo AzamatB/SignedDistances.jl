@@ -228,10 +228,19 @@ Returns a `SignedDistanceMesh{Tg,Ts}` ready for `compute_signed_distance!` calls
 function preprocess_mesh(
     mesh::Mesh{3,Float32,GLTriangleFace}, sign_type::Type{Ts}=Float64; leaf_capacity::Int=8
 ) where {Ts<:AbstractFloat}
-    Tg = Float32
     vertices = GeometryBasics.coordinates(mesh)
     tri_faces = GeometryBasics.faces(mesh)
     faces = NTuple{3,Int32}.(tri_faces)
+    return preprocess_mesh(vertices, faces, sign_type; leaf_capacity)
+end
+
+function preprocess_mesh(
+    vertices::Vector{Point3f},
+    faces::Vector{NTuple{3,Int32}},
+    sign_type::Type{Ts}=Float64;
+    leaf_capacity::Int=8
+) where {Ts<:AbstractFloat}
+    Tg = Float32
     num_vertices = length(vertices)
     num_faces = length(faces)
 
@@ -407,10 +416,10 @@ end
 
 # exact closest-point-on-triangle (Ericson-style) but returns Δ = p - closest_point.
 # This avoids computing and storing closest point, and makes the sign test use Δ directly.
-@inline function closest_diff_triangle(p::Point3{Tg}, tg::TriangleGeometry{Tg}) where {Tg}
-    a = tg.a
-    ab = tg.ab
-    ac = tg.ac
+@inline function closest_diff_triangle(p::Point3{Tg}, triangle::TriangleGeometry{Tg}) where {Tg}
+    a = triangle.a
+    ab = triangle.ab
+    ac = triangle.ac
 
     ap = p - a
     d1 = ab ⋅ ap
@@ -473,31 +482,42 @@ end
 
 ######################################   Single-Point Query   ######################################
 
-@inline function signed_distance_point(
-    sdm::SignedDistanceMesh{Tg,Ts},
-    point::Point3{Tg},
-    upper_bound²::Tg,
-    stack::Vector{NodeDist{Tg}},
-    hint_face::Int32
-) where {Tg,Ts}
-    dist²_best = upper_bound²
+function signed_distance_point(
+    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, hint_face::Int32, stack::Vector{NodeDist{Tg}}
+) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    # tighten initial bound using the provided triangle hint (packed index).
+    # this is especially effective for near-surface samples.
+    tri_best = hint_face
+    @inbounds triangle = sdm.tri_geometries[tri_best]
+    (dist²_best, Δ_best, feat_best) = closest_diff_triangle(point, triangle)
+    (dist²_best <= 0) && return zero(Tg)
+
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    return signed_distance::Tg
+end
+
+function signed_distance_point(
+    sdm::SignedDistanceMesh{Tg,Ts}, point::Point3{Tg}, stack::Vector{NodeDist{Tg}}
+) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
+    dist²_best = Tg(Inf)
     Δ_best = zero(Point3{Tg})
     feat_best = UInt8(0)
     tri_best = Int32(0)
+    signed_distance = signed_distance_point_kernel(sdm, point, dist²_best, Δ_best, feat_best, tri_best, stack)
+    return signed_distance::Tg
+end
 
-    tri_geometries = sdm.tri_geometries
-    # tighten initial bound using the provided triangle hint (packed index).
-    # this is especially effective for near-surface samples.
-    @inbounds (dist²_hint, Δ_hint, feat_hint) = closest_diff_triangle(point, tri_geometries[hint_face])
-    if dist²_hint < dist²_best
-        dist²_best = dist²_hint
-        Δ_best = Δ_hint
-        feat_best = feat_hint
-        tri_best = hint_face
-    end
-    (dist²_best <= 0) && return zero(Tg)
-
+function signed_distance_point_kernel(
+    sdm::SignedDistanceMesh{Tg,Ts},
+    point::Point3{Tg},
+    dist²_best::Tg,
+    Δ_best::Point3{Tg},
+    feat_best::UInt8,
+    tri_best::Int32,
+    stack::Vector{NodeDist{Tg}}
+) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     bvh = sdm.bvh
+    tri_geometries = sdm.tri_geometries
     stack_top = 1
     dist²_root = aabb_dist²(point, bvh, Int32(1))
     @inbounds stack[1] = NodeDist{Tg}(Int32(1), dist²_root)
@@ -550,7 +570,7 @@ end
         end
     end
 
-    iszero(tri_best) && return Tg(NaN)
+    iszero(tri_best) && error("No triangle found for point $point")
     dist = √(dist²_best)
     iszero(dist) && return zero(Tg)
 
@@ -564,25 +584,22 @@ end
 
     uno = one(Tg)
     sgn = ifelse(dot64 >= 0.0, uno, -uno)
-    signed_dist = sgn * dist
-    return signed_dist
+    signed_distance = sgn * dist
+    return signed_distance::Tg
 end
 
 ##########################################   Public API   ##########################################
 
 """
-    compute_signed_distance!(out, sdm, points_mat, upper_bounds², hint_faces)
+    compute_signed_distance!(out, sdm, points_mat, [hint_faces])
 
 In-place batch signed distance query. Writes results into `out`.
 - `out`:            length-n vector to store the output signed distances.
 - `sdm`:            a [`SignedDistanceMesh`] built once via `preprocess_mesh`.
 - `points_mat`:     `3 × n` matrix of query points (Float32 recommended).
-- `upper_bounds²`:  length-n vector of unsigned distance upper bounds per point.
-                    Pass `Inf` for any point without a known bound.
-- `hint_faces`:     length-n vector of *original* face indices (1-based,
-                    matching the input `faces`) for each point.
-                    This uses a single exact triangle check to tighten the upper bound before
-                    BVH traversal, which can substantially speed up near-surface queries.
+- `hint_faces`:     length-n vector of *original* face indices (1-based, matching the input `faces`)
+                    for each point. This uses a single exact triangle check to tighten the upper
+                    bound before BVH traversal, which can substantially speed up near-surface queries.
 
 Positive = outside, negative = inside.
 
@@ -594,18 +611,14 @@ function compute_signed_distance!(
     out::AbstractVector{Tg},
     sdm::SignedDistanceMesh{Tg,Ts},
     points::StridedMatrix{Tg},
-    upper_bounds²::AbstractVector{Tg},
     hint_faces::Vector{Int32}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
-    @assert size(points, 1) == 3 "points matrix must be 3×n"
     num_points = size(points, 2)
-    @assert length(out) == num_points
-    @assert length(upper_bounds²) == num_points
-    @assert length(hint_faces) == num_points
+    @assert length(out) == length(hint_faces) == num_points
+    @assert size(points, 1) == 3 "points matrix must be 3×n"
 
     face_to_packed = sdm.face_to_packed
     stacks = allocate_stacks(sdm)
-
     # equipartition the work into chunks, so each chunk gets its own stack.
     # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
     # concurrent callers on the same sdm never share mutable scratch space.
@@ -617,30 +630,36 @@ function compute_signed_distance!(
         chunk_end = min(idx_chunk * chunk_size, num_points)
         for idx in chunk_start:chunk_end
             idx_face = hint_faces[idx]
-            idx_face_packed = face_to_packed[idx_face]
+            @inbounds idx_face_packed = face_to_packed[idx_face]
             @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
-            @inbounds out[idx] = signed_distance_point(
-                sdm, point, upper_bounds²[idx], stack, idx_face_packed
-            )
+            @inbounds out[idx] = signed_distance_point(sdm, point, idx_face_packed, stack)
         end
     end
     return out
 end
 
-"""
-    compute_signed_distance(sdm, points, upper_bounds², hint_faces) → Vector{Tg}
-
-Allocating batch signed distance query. See `compute_signed_distance!`.
-"""
-function compute_signed_distance(
-    sdm::SignedDistanceMesh{Tg,Ts},
-    points::StridedMatrix{Tg},
-    upper_bounds²::AbstractVector{Tg},
-    hint_faces::Vector{Int32}
+function compute_signed_distance!(
+    out::AbstractVector{Tg}, sdm::SignedDistanceMesh{Tg,Ts}, points::StridedMatrix{Tg}
 ) where {Tg<:AbstractFloat,Ts<:AbstractFloat}
     num_points = size(points, 2)
-    out = Vector{Tg}(undef, num_points)
-    compute_signed_distance!(out, sdm, points, upper_bounds², hint_faces)
+    @assert length(out) == num_points
+    @assert size(points, 1) == 3 "points matrix must be 3×n"
+
+    stacks = allocate_stacks(sdm)
+    # equipartition the work into chunks, so each chunk gets its own stack.
+    # to ensure thread-safety, stacks are allocated per-call (not stored in the struct) so that
+    # concurrent callers on the same sdm never share mutable scratch space.
+    num_chunks = length(stacks)
+    chunk_size = cld(num_points, num_chunks)
+    Threads.@threads :dynamic for idx_chunk in 1:num_chunks
+        stack = stacks[idx_chunk]
+        chunk_start = (idx_chunk - 1) * chunk_size + 1
+        chunk_end = min(idx_chunk * chunk_size, num_points)
+        for idx in chunk_start:chunk_end
+            @inbounds point = Point3{Tg}(points[1, idx], points[2, idx], points[3, idx])
+            @inbounds out[idx] = signed_distance_point(sdm, point, stack)
+        end
+    end
     return out
 end
 
